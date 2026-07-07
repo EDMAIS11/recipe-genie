@@ -1,18 +1,29 @@
 [build]
   command = "npm run build"
-  # Nitro's Netlify preset writes the static client here and turns the SSR
-  # server into a Netlify Function automatically when it detects the Netlify
-  # build environment. If a deploy fails to find the publish dir, check the
-  # build log for the path Nitro reports and adjust this value.
   publish = "dist/client"
 
 [build.environment]
-  # Force Nitro's Netlify output preset (it also auto-detects on Netlify CI).
-  NITRO_PRESET = "netlify"
   NODE_VERSION = "22"
+
+# The static client is in dist/client (publish dir above). The SSR server is a
+# universal handler at dist/server/server.js, served by the Netlify Function in
+# netlify/functions/server.mjs. We bundle that function with esbuild and include
+# the whole dist/server folder so the function can import the handler at runtime.
+[functions]
+  directory = "netlify/functions"
+  node_bundler = "esbuild"
+  included_files = ["dist/server/**"]
+
+# Send every request to the SSR function, but let real static files
+# (JS/CSS/assets in dist/client) be served directly first.
+[[redirects]]
+  from = "/*"
+  to = "/.netlify/functions/server"
+  status = 200
+  force = false
 
 # Set your secrets in the Netlify UI (Site settings > Environment variables),
 # NOT here — this file is committed to git:
 #   SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, SUPABASE_SERVICE_ROLE_KEY,
 #   VITE_SUPABASE_URL, VITE_SUPABASE_PUBLISHABLE_KEY,
-#   AI_API_KEY, AI_GATEWAY_URL, AI_MODEL, FIRECRAWL_API_KEY
+#   AI_API_KEY, AI_GATEWAY_URL, AI_MODEL, JINA_API_KEY
