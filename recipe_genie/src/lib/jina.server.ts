@@ -3,10 +3,10 @@
 // Uses three free/cheap Jina endpoints:
 //   - r.jina.ai/<url>   -> clean markdown (and, on a second call, HTML)
 //   - s.jina.ai/?q=...  -> web search returning top results with URLs
-//   - the target site's sitemap.xml, FETCHED THROUGH r.jina.ai -> URL discovery
+//   - the target site's sitemap, FETCHED THROUGH r.jina.ai -> URL discovery,
+//     with a search-based fallback when the sitemap can't be read.
 //
-// Set JINA_API_KEY in your environment for higher rate limits. Requests still
-// work without a key but are throttled more aggressively.
+// Set JINA_API_KEY in your environment for higher rate limits.
 
 const READER_BASE = "https://r.jina.ai/";
 const SEARCH_BASE = "https://s.jina.ai/";
@@ -20,14 +20,12 @@ function jinaHeaders(extra: Record<string, string> = {}): Record<string, string>
 }
 
 /**
- * Scrape a single page. Returns clean markdown and (optionally) the raw HTML,
- * which some callers need to read JSON-LD / og:image out of the page.
+ * Scrape a single page. Returns clean markdown and (optionally) the raw HTML.
  */
 export async function jinaScrape(
   url: string,
   opts: { includeHtml?: boolean } = {},
 ): Promise<{ markdown: string; html: string; metadata: Record<string, unknown> }> {
-  // 1) Markdown (JSON response so we also get title/metadata).
   const mdRes = await fetch(READER_BASE + url, {
     headers: jinaHeaders({ Accept: "application/json" }),
   });
@@ -43,8 +41,6 @@ export async function jinaScrape(
     ...(data?.metadata ?? {}),
   };
 
-  // 2) Raw HTML (second call) only when the caller needs it — e.g. to detect a
-  //    Recipe JSON-LD schema. Kept optional to avoid doubling every request.
   let html = "";
   if (opts.includeHtml) {
     const htmlRes = await fetch(READER_BASE + url, {
@@ -60,7 +56,6 @@ export async function jinaScrape(
 
 /**
  * Web search. Returns up to `limit` results (url + title + snippet/content).
- * Replaces Firecrawl's fc.search().
  */
 export async function jinaSearch(
   query: string,
@@ -86,13 +81,9 @@ export async function jinaSearch(
 }
 
 /**
- * Discover URLs on a site by reading its sitemap(s). Replaces Firecrawl's
- * fc.map(). Handles sitemap indexes (a sitemap that lists other sitemaps).
- *
- * IMPORTANT: the sitemap is fetched THROUGH r.jina.ai, not directly. Many
- * cooking sites (e.g. 24kitchen.pt) sit behind bot protection (Cloudflare) that
- * returns HTTP 403 to any server-side fetch, even with a browser User-Agent.
- * Jina fetches from its own infrastructure and bypasses that block.
+ * Discover recipe URLs on a site. Tries the sitemap first (through r.jina.ai,
+ * because a direct fetch is blocked by bot protection), and falls back to a
+ * site-scoped web search if the sitemap yields nothing.
  */
 export async function discoverUrlsFromSitemap(
   host: string,
@@ -101,27 +92,29 @@ export async function discoverUrlsFromSitemap(
   const pathIncludes = opts.pathIncludes ?? [];
   const limit = opts.limit ?? 500;
   const origin = new URL(host).origin;
+  const bareHost = new URL(host).hostname.replace(/^www\./, "");
 
-  // Fetch a sitemap through Jina Reader in raw-text mode so the XML survives.
-  // Any failure is logged (no more silent empty strings).
-  async function fetchXml(u: string): Promise<string> {
+  // Fetch through Jina Reader in raw-text mode, logging status + a body snippet
+  // so we can SEE what actually comes back when discovery finds nothing.
+  async function fetchViaJina(u: string): Promise<string> {
     try {
       const res = await fetch(READER_BASE + u, {
         headers: jinaHeaders({ "X-Return-Format": "text" }),
       });
-      if (!res.ok) {
-        console.error(`[discoverUrls] Jina devolveu ${res.status} para ${u}`);
-        return "";
-      }
-      return await res.text();
+      const body = res.ok ? await res.text() : "";
+      console.error(
+        `[discoverUrls] GET ${u} -> status=${res.status} len=${body.length} head=${JSON.stringify(
+          body.slice(0, 300),
+        )}`,
+      );
+      return body;
     } catch (err) {
       console.error(`[discoverUrls] erro ao ir buscar ${u}:`, err);
       return "";
     }
   }
 
-  // Extract URLs whether they arrive wrapped in <loc>...</loc> (raw XML) or as
-  // bare text (Jina's text mode can strip the tags but keeps the URLs).
+  // Extract URLs whether wrapped in <loc>...</loc> or present as bare text.
   function extractLocs(text: string): string[] {
     if (!text) return [];
     const locs: string[] = [];
@@ -129,44 +122,75 @@ export async function discoverUrlsFromSitemap(
     let m: RegExpExecArray | null;
     while ((m = locRe.exec(text)) !== null) locs.push(m[1]);
     if (locs.length === 0) {
-      // Fallback: any absolute URL on this origin found in the raw text.
-      const escaped = origin.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const urlRe = new RegExp(`${escaped}/[^\\s"'<>]+`, "gi");
+      // Fallback: any absolute http(s) URL on this host found in the raw text.
+      const escaped = bareHost.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const urlRe = new RegExp(`https?://[a-z0-9.-]*${escaped}/[^\\s"'<>)\\]]+`, "gi");
       let u: RegExpExecArray | null;
       while ((u = urlRe.exec(text)) !== null) locs.push(u[0]);
     }
     return locs;
   }
 
-  // Start from /sitemap.xml; if it's an index, follow the child sitemaps.
-  const rootXml = await fetchXml(`${origin}/sitemap.xml`);
-  let candidateSitemaps = [`${origin}/sitemap.xml`];
-  const rootLocs = extractLocs(rootXml);
-  const childSitemaps = rootLocs.filter((l) => /\.xml($|\?)/i.test(l));
-  if (childSitemaps.length > 0) candidateSitemaps = childSitemaps;
+  function keep(loc: string): boolean {
+    if (/\.xml($|\?)/i.test(loc)) return false;
+    if (pathIncludes.length > 0 && !pathIncludes.some((p) => loc.includes(p))) return false;
+    return true;
+  }
 
   const seen = new Set<string>();
   const urls: string[] = [];
+  const push = (loc: string) => {
+    if (urls.length >= limit || seen.has(loc) || !keep(loc)) return;
+    seen.add(loc);
+    urls.push(loc);
+  };
 
-  for (const sm of candidateSitemaps) {
+  // 1) Try a few common sitemap locations. Follow one level of sitemap index.
+  const rootCandidates = [
+    `${origin}/sitemap_index.xml`,
+    `${origin}/sitemap.xml`,
+    `${origin}/wp-sitemap.xml`,
+  ];
+
+  for (const root of rootCandidates) {
     if (urls.length >= limit) break;
-    const xml =
-      sm === `${origin}/sitemap.xml` && childSitemaps.length === 0 ? rootXml : await fetchXml(sm);
-    for (const loc of extractLocs(xml)) {
-      if (/\.xml($|\?)/i.test(loc)) continue; // skip nested sitemap entries
-      if (seen.has(loc)) continue;
-      if (pathIncludes.length > 0 && !pathIncludes.some((p) => loc.includes(p))) continue;
-      seen.add(loc);
-      urls.push(loc);
-      if (urls.length >= limit) break;
+    const xml = await fetchViaJina(root);
+    const locs = extractLocs(xml);
+    if (locs.length === 0) continue;
+
+    const childSitemaps = locs.filter((l) => /\.xml($|\?)/i.test(l));
+    if (childSitemaps.length > 0) {
+      for (const sm of childSitemaps) {
+        if (urls.length >= limit) break;
+        const childXml = await fetchViaJina(sm);
+        for (const loc of extractLocs(childXml)) push(loc);
+      }
+    } else {
+      for (const loc of locs) push(loc);
+    }
+    if (urls.length > 0) break; // this root worked; stop trying others
+  }
+
+  // 2) Fallback: site-scoped search when the sitemap gave us nothing.
+  if (urls.length === 0) {
+    console.error(`[discoverUrls] sitemap vazio para ${origin} — a tentar pesquisa`);
+    const pathHint = pathIncludes[0] ? pathIncludes[0].replace(/\//g, " ") : "receitas";
+    try {
+      const results = await jinaSearch(`site:${bareHost} ${pathHint}`, { limit: 20 });
+      for (const r of results) {
+        if (r.url.includes(bareHost)) push(r.url);
+      }
+      console.error(
+        `[discoverUrls] pesquisa devolveu ${results.length} resultados, ${urls.length} úteis`,
+      );
+    } catch (err) {
+      console.error(`[discoverUrls] pesquisa falhou:`, err);
     }
   }
 
   if (urls.length === 0) {
     console.error(
-      `[discoverUrls] 0 URLs para ${origin} — verifica o caminho do sitemap e o pathIncludes (${JSON.stringify(
-        pathIncludes,
-      )})`,
+      `[discoverUrls] 0 URLs para ${origin} (pathIncludes=${JSON.stringify(pathIncludes)})`,
     );
   }
   return urls;
