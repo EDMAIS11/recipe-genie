@@ -1,19 +1,18 @@
-// Netlify Background Function.
-//
-// O sufixo "-background" no nome do ficheiro é o que diz ao Netlify para a
-// tratar como background function: responde 202 de imediato a quem a invoca e
-// continua a correr até 15 minutos (em vez dos ~10s de uma função síncrona).
-//
-// É disparada (fire-and-forget) pela server function `bulkImportSite`. Corre
-// com o cliente de serviço do Supabase (ignora RLS), por isso escreve as
-// receitas de forma global.
+// Netlify Background Function (sufixo -background => corre até 15 min).
+// Versão COM DIAGNÓSTICO: regista o estado das variáveis de ambiente e faz um
+// teste directo ao Supabase para localizar a origem do "Invalid API key".
 import { runBulkImport } from "../../src/lib/bulk-import.server";
 import { supabaseAdmin } from "../../src/integrations/supabase/client.server";
 
+function describeKey(k) {
+  if (!k) return "AUSENTE";
+  return `len=${k.length} inicio=${JSON.stringify(k.slice(0, 6))} fim=${JSON.stringify(
+    k.slice(-6),
+  )} temNL=${/\s/.test(k)}`;
+}
+
 export default async (req) => {
   try {
-    // Proteção: só aceita pedidos com o segredo partilhado que a server
-    // function autenticada envia. Impede que o endpoint público seja abusado.
     const secret = req.headers.get("x-import-secret");
     if (!process.env.IMPORT_TRIGGER_SECRET || secret !== process.env.IMPORT_TRIGGER_SECRET) {
       return new Response("forbidden", { status: 403 });
@@ -22,6 +21,32 @@ export default async (req) => {
     const body = await req.json().catch(() => ({}));
     const { source_id, limit = 25, user_id = null } = body ?? {};
     if (!source_id) return new Response("source_id em falta", { status: 400 });
+
+    // ---- DIAGNÓSTICO ----
+    const url = process.env.SUPABASE_URL;
+    const key = process.env.SUPABASE_SERVICE_ROLE_KEY;
+    console.error(`[import-bg][diag] SUPABASE_URL=${JSON.stringify(url)}`);
+    console.error(`[import-bg][diag] SERVICE_ROLE_KEY: ${describeKey(key)}`);
+
+    // Teste directo ao REST do Supabase, sem passar pelo supabase-js, para ver
+    // o status real que a chave produz.
+    try {
+      const probe = await fetch(`${url}/rest/v1/import_sources?select=id&limit=1`, {
+        headers: {
+          apikey: key ?? "",
+          Authorization: `Bearer ${key ?? ""}`,
+        },
+      });
+      const txt = await probe.text();
+      console.error(
+        `[import-bg][diag] probe REST -> status=${probe.status} body=${JSON.stringify(
+          txt.slice(0, 200),
+        )}`,
+      );
+    } catch (e) {
+      console.error(`[import-bg][diag] probe REST falhou:`, e?.message ?? e);
+    }
+    // ---- FIM DIAGNÓSTICO ----
 
     const { data: src, error } = await supabaseAdmin
       .from("import_sources")
@@ -41,7 +66,7 @@ export default async (req) => {
       limit,
       userId: user_id,
       supabase: supabaseAdmin,
-      maxMillis: 780000, // 13 min — margem confortável dentro dos 15 min
+      maxMillis: 780000,
     });
 
     const exhausted =
