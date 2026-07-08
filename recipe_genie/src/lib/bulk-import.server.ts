@@ -110,7 +110,7 @@ export async function runBulkImport(params: {
 
     try {
       const { markdown, html: rawHtml, metadata } = await withTimeout(
-        jinaScrape(url, { includeHtml: true }),
+        jinaScrape(url, { includeHtml: false }),
         Math.min(remaining - 2000, 30000),
         url,
       );
