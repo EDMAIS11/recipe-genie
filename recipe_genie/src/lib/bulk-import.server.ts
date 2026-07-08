@@ -40,9 +40,9 @@ export function siteKeyFromHost(host: string): string {
   }
 }
 
-// Resolve/reject `p` but never take longer than `ms`. The underlying request
-// keeps running in the background if it loses the race, but it is abandoned
-// once the function returns — the important thing is that we return in time.
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// Resolve/reject `p` mas nunca demora mais do que `ms`.
 function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
   return Promise.race([
     p,
@@ -56,15 +56,16 @@ export async function runBulkImport(params: {
   site: string;
   config: BulkImportConfig;
   limit: number;
-  userId: string;
+  userId: string | null;
   supabase: any;
-  // Orçamento de tempo total. Default seguro para uma função síncrona do
-  // Netlify (limite 10s). Numa background function podes passar, ex., 800000.
+  // Orçamento de tempo total. Numa background function podes passar, ex., 780000.
   maxMillis?: number;
+  // Pausa entre receitas (ms), para respeitar o rate limit do Gemini free tier.
+  pauseMs?: number;
 }): Promise<BulkImportResult> {
   const { site, config, limit, userId, supabase } = params;
   const maxMillis = params.maxMillis ?? 8500;
-  const CONCURRENCY = 3; // scrapes em paralelo por lote (conservador p/ o Jina)
+  const pauseMs = params.pauseMs ?? 5000; // ~12 receitas/min, dentro do free tier
   const started = Date.now();
   const deadline = started + maxMillis;
 
@@ -100,37 +101,34 @@ export async function runBulkImport(params: {
   };
   if (toImport.length === 0) return result;
 
-  async function importOne(url: string, budgetMs: number): Promise<void> {
-    const { markdown, html: rawHtml, metadata } = await jinaScrape(url, {
-      includeHtml: true,
-    });
-    if (!markdown) throw new Error("sem markdown");
-    const recipe = await extractRecipeFromMarkdown({ url, markdown, rawHtml, metadata, aiKey });
-    await persistExtractedRecipe({ recipe, userId, supabase });
-  }
-
-  // Processa em lotes concorrentes, parando quando o orçamento de tempo acaba.
-  // O que não for importado nesta corrida fica para a próxima (o agendador de
-  // 30 min continua a esgotar a fila, e os duplicados já são ignorados).
-  for (let i = 0; i < toImport.length; i += CONCURRENCY) {
+  // Sequencial (concorrência 1) com pausa entre receitas: o gargalo é o rate
+  // limit do Gemini, não o tempo — e a background function tem 15 min.
+  for (let i = 0; i < toImport.length; i++) {
     const remaining = deadline - Date.now();
-    if (remaining <= 1500) break; // não vale a pena começar outro lote
-    const batch = toImport.slice(i, i + CONCURRENCY);
+    if (remaining <= 8000) break; // reservamos margem para não estourar
+    const url = toImport[i];
 
-    const settled = await Promise.allSettled(
-      batch.map((url) => withTimeout(importOne(url, remaining), remaining, url)),
-    );
+    try {
+      const { markdown, html: rawHtml, metadata } = await withTimeout(
+        jinaScrape(url, { includeHtml: true }),
+        Math.min(remaining - 2000, 30000),
+        url,
+      );
+      if (!markdown) throw new Error("sem markdown");
+      const recipe = await extractRecipeFromMarkdown({ url, markdown, rawHtml, metadata, aiKey });
+      await persistExtractedRecipe({ recipe, userId: userId as any, supabase });
+      result.imported++;
+    } catch (e: any) {
+      result.failed++;
+      const msg = e?.message ?? String(e);
+      result.errors.push({ url, error: msg });
+      console.error(`[bulkImport] FALHA ${url}: ${msg}`);
+    }
 
-    settled.forEach((s, idx) => {
-      if (s.status === "fulfilled") {
-        result.imported++;
-      } else {
-        result.failed++;
-        const msg = s.reason?.message ?? String(s.reason);
-        result.errors.push({ url: batch[idx], error: msg });
-        console.error(`[bulkImport] FALHA ${batch[idx]}: ${msg}`);
-      }
-    });
+    // Pausa antes da próxima (exceto na última), para não bater no rate limit.
+    if (i < toImport.length - 1 && Date.now() + pauseMs < deadline) {
+      await sleep(pauseMs);
+    }
   }
 
   console.error(
