@@ -438,13 +438,19 @@ function BulkImportPanel() {
     onError: (e) => toast.error(e instanceof Error ? e.message : "Erro"),
   });
 
-  const run = async (id: string, label: string) => {
+ const run = async (id: string, label: string) => {
     setBusy(id);
     try {
-      const res = await runFn({ data: { source_id: id, limit: 25 } });
-      toast.success(`${label}: ${res.imported} importadas, ${res.failed} falhas`);
-      qc.invalidateQueries({ queryKey: ["recipes"] });
-      qc.invalidateQueries({ queryKey: ["import-sources"] });
+      await runFn({ data: { source_id: id, limit: 25 } });
+      toast.success(`${label}: importação iniciada. As receitas vão aparecer dentro de instantes.`);
+      // A importação corre em segundo plano (até 15 min); vamos atualizando a
+      // lista algumas vezes à medida que as receitas são guardadas.
+      [8000, 20000, 45000, 90000].forEach((ms) =>
+        setTimeout(() => {
+          qc.invalidateQueries({ queryKey: ["recipes"] });
+          qc.invalidateQueries({ queryKey: ["import-sources"] });
+        }, ms),
+      );
     } catch (e: any) {
       toast.error(e?.message ?? "Erro");
     } finally {
