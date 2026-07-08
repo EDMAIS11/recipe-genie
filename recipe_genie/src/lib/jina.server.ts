@@ -93,9 +93,8 @@ export async function discoverUrlsFromSitemap(
   const limit = opts.limit ?? 500;
   const origin = new URL(host).origin;
   const bareHost = new URL(host).hostname.replace(/^www\./, "");
+  const escapedHost = bareHost.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
-  // Fetch through Jina Reader in raw-text mode, logging status + a body snippet
-  // so we can SEE what actually comes back when discovery finds nothing.
   async function fetchViaJina(u: string): Promise<string> {
     try {
       const res = await fetch(READER_BASE + u, {
@@ -104,7 +103,7 @@ export async function discoverUrlsFromSitemap(
       const body = res.ok ? await res.text() : "";
       console.error(
         `[discoverUrls] GET ${u} -> status=${res.status} len=${body.length} head=${JSON.stringify(
-          body.slice(0, 300),
+          body.slice(0, 200),
         )}`,
       );
       return body;
@@ -114,19 +113,30 @@ export async function discoverUrlsFromSitemap(
     }
   }
 
-  // Extract URLs whether wrapped in <loc>...</loc> or present as bare text.
+  // Extract URLs. Handles two shapes:
+  //   a) proper XML with <loc>...</loc> tags;
+  //   b) Jina's text mode, which strips tags AND whitespace, gluing each URL to
+  //      the lastmod/changefreq/priority that followed it, e.g.
+  //        https://www.24kitchen.pt/receita/x2026-05-19weekly0.8https://...
+  //      We match each URL lazily and cut it where the next token begins: a
+  //      lastmod date (YYYY-MM-DD), the next https://, whitespace, or end.
   function extractLocs(text: string): string[] {
     if (!text) return [];
     const locs: string[] = [];
+
     const locRe = /<loc>\s*([^<\s]+)\s*<\/loc>/gi;
     let m: RegExpExecArray | null;
     while ((m = locRe.exec(text)) !== null) locs.push(m[1]);
-    if (locs.length === 0) {
-      // Fallback: any absolute http(s) URL on this host found in the raw text.
-      const escaped = bareHost.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const urlRe = new RegExp(`https?://[a-z0-9.-]*${escaped}/[^\\s"'<>)\\]]+`, "gi");
-      let u: RegExpExecArray | null;
-      while ((u = urlRe.exec(text)) !== null) locs.push(u[0]);
+    if (locs.length > 0) return locs;
+
+    const urlRe = new RegExp(
+      `https?://[a-z0-9.-]*${escapedHost}/[^\\s"'<>)\\]]*?(?=\\d{4}-\\d{2}-\\d{2}|https?://|[\\s"'<>)\\]]|$)`,
+      "gi",
+    );
+    let u: RegExpExecArray | null;
+    while ((u = urlRe.exec(text)) !== null) {
+      if (u[0]) locs.push(u[0]);
+      if (u.index === urlRe.lastIndex) urlRe.lastIndex++; // guard against zero-length matches
     }
     return locs;
   }
@@ -145,10 +155,11 @@ export async function discoverUrlsFromSitemap(
     urls.push(loc);
   };
 
-  // 1) Try a few common sitemap locations. Follow one level of sitemap index.
+  // 1) Try common sitemap locations. sitemap.xml first — confirmed to work for
+  //    24kitchen.pt. Follow one level of sitemap index when present.
   const rootCandidates = [
-    `${origin}/sitemap_index.xml`,
     `${origin}/sitemap.xml`,
+    `${origin}/sitemap_index.xml`,
     `${origin}/wp-sitemap.xml`,
   ];
 
@@ -162,36 +173,29 @@ export async function discoverUrlsFromSitemap(
     if (childSitemaps.length > 0) {
       for (const sm of childSitemaps) {
         if (urls.length >= limit) break;
-        const childXml = await fetchViaJina(sm);
-        for (const loc of extractLocs(childXml)) push(loc);
+        for (const loc of extractLocs(await fetchViaJina(sm))) push(loc);
       }
     } else {
       for (const loc of locs) push(loc);
     }
-    if (urls.length > 0) break; // this root worked; stop trying others
+    if (urls.length > 0) break; // this root worked
   }
 
   // 2) Fallback: site-scoped search when the sitemap gave us nothing.
   if (urls.length === 0) {
-    console.error(`[discoverUrls] sitemap vazio para ${origin} — a tentar pesquisa`);
-    const pathHint = pathIncludes[0] ? pathIncludes[0].replace(/\//g, " ") : "receitas";
+    console.error(`[discoverUrls] sitemap sem URLs úteis para ${origin} — a tentar pesquisa`);
+    const pathHint = pathIncludes[0] ? pathIncludes[0].replace(/\//g, " ").trim() : "receitas";
     try {
       const results = await jinaSearch(`site:${bareHost} ${pathHint}`, { limit: 20 });
-      for (const r of results) {
-        if (r.url.includes(bareHost)) push(r.url);
-      }
+      for (const r of results) if (r.url.includes(bareHost)) push(r.url);
       console.error(
-        `[discoverUrls] pesquisa devolveu ${results.length} resultados, ${urls.length} úteis`,
+        `[discoverUrls] pesquisa: ${results.length} resultados, ${urls.length} úteis`,
       );
     } catch (err) {
       console.error(`[discoverUrls] pesquisa falhou:`, err);
     }
   }
 
-  if (urls.length === 0) {
-    console.error(
-      `[discoverUrls] 0 URLs para ${origin} (pathIncludes=${JSON.stringify(pathIncludes)})`,
-    );
-  }
+  console.error(`[discoverUrls] total ${urls.length} URLs para ${origin}`);
   return urls;
 }
