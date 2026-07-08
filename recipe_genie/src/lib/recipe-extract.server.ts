@@ -164,6 +164,56 @@ Regras:
 - ingredients: nome no singular, quantidade numérica se possível, unit em g/ml/un/colher_sopa/colher_cha/dente.
 - Se não souberes, usa null (ou [] para tags/ingredients).`;
 
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// Tenta obter o "retry delay" (segundos) que o Google devolve na resposta 429.
+function parseRetryDelaySec(err: any): number | null {
+  const txt = `${err?.message ?? ""} ${JSON.stringify(err?.data ?? err?.responseBody ?? "")}`;
+  const m = txt.match(/retryDelay["':\s]+(\d+(?:\.\d+)?)s/i);
+  if (m) return Number(m[1]);
+  return null;
+}
+
+function isRateLimit(err: any): boolean {
+  const s = err?.statusCode ?? err?.status;
+  const msg = String(err?.message ?? "").toLowerCase();
+  return s === 429 || msg.includes("too many requests") || msg.includes("rate limit") || msg.includes("resource_exhausted");
+}
+
+// Chama o modelo com backoff que RESPEITA o 429: se o Google pedir para esperar,
+// espera esse tempo (ou um backoff crescente) e tenta de novo, em vez de
+// desistir ao fim de 3 tentativas rápidas. Requer uma função com tempo (a
+// background function tem 15 min).
+async function generateWithRetry(
+  args: Parameters<typeof generateText>[0],
+  url: string,
+  maxAttempts = 6,
+): Promise<string> {
+  let lastErr: any;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      const { text } = await generateText(args);
+      return text;
+    } catch (err: any) {
+      lastErr = err;
+      if (!isRateLimit(err) || attempt === maxAttempts) break;
+      const suggested = parseRetryDelaySec(err);
+      // espera o que o Google pediu, ou backoff 15s, 30s, 45s... (teto 60s)
+      const waitMs = Math.min(
+        (suggested != null ? suggested + 1 : 15 * attempt) * 1000,
+        60000,
+      );
+      console.error(
+        `[extract] 429 em ${url} (tentativa ${attempt}/${maxAttempts}), a esperar ${Math.round(
+          waitMs / 1000,
+        )}s`,
+      );
+      await sleep(waitMs);
+    }
+  }
+  throw lastErr;
+}
+
 export async function extractRecipeFromMarkdown(params: {
   url: string;
   markdown: string;
@@ -173,15 +223,8 @@ export async function extractRecipeFromMarkdown(params: {
 }): Promise<ExtractedRecipe> {
   const { url, markdown, rawHtml, metadata, aiKey } = params;
 
-  // Guard: only accept pages that expose a Recipe JSON-LD schema. Hub /
-  // collection pages (e.g. jamieoliver.com/recipes/christmas) look like
-  // recipes to the AI (they render featured cards) and produce duplicated,
-  // mismatched entries. If there's no Recipe schema, this URL is not a
-  // real recipe page.
-  const recipeNode = findRecipeJsonLd(rawHtml);
-  if (!recipeNode) {
-    throw new Error("Página não é uma receita (sem schema Recipe).");
-  }
+  // JSON-LD é BÓNUS (imagem/autor), não porteiro — o Jina limpa os <script>.
+  const hasJsonLd = !!findRecipeJsonLd(rawHtml);
 
   const jsonLdImage = pickImageFromJsonLd(rawHtml);
   const jsonLdAuthor = pickAuthorFromJsonLd(rawHtml);
@@ -197,15 +240,28 @@ export async function extractRecipeFromMarkdown(params: {
   const gateway = createAiProvider(aiKey);
   const model = gateway(process.env.AI_MODEL || "gemini-2.5-flash");
 
-  const { text } = await generateText({
-    model,
-    system: SYSTEM_PROMPT,
-    prompt: `URL: ${url}\n\nMarkdown:\n${markdown.slice(0, 15000)}`,
-  });
-
+  let text = "";
+  try {
+    text = await generateWithRetry(
+      {
+        model,
+        system: SYSTEM_PROMPT,
+        prompt: `URL: ${url}\n\nMarkdown:\n${markdown.slice(0, 15000)}`,
+      },
+      url,
+    );
+  } catch (err: any) {
+    console.error(`[extract] falha na chamada ao modelo para ${url}:`, err?.message ?? err);
+    throw new Error(`Chamada ao modelo falhou: ${err?.message ?? String(err)}`);
+  }
 
   const parsed = extractJson(text);
   if (!parsed || typeof parsed !== "object") {
+    console.error(
+      `[extract] resposta não-JSON para ${url} (len=${text?.length ?? 0}) head=${JSON.stringify(
+        (text ?? "").slice(0, 200),
+      )}`,
+    );
     throw new Error("Não foi possível extrair a receita (resposta não-JSON).");
   }
 
@@ -232,10 +288,21 @@ export async function extractRecipeFromMarkdown(params: {
       ? parsed.author.trim().slice(0, 120)
       : null;
 
+  const title =
+    typeof parsed.title === "string" && parsed.title.trim() ? parsed.title.trim() : null;
+
+  if (!title || ingredients.length < 2) {
+    throw new Error(
+      `Não parece uma receita (título=${title ? "sim" : "não"}, ingredientes=${ingredients.length}${
+        hasJsonLd ? "" : ", sem JSON-LD"
+      }).`,
+    );
+  }
+
   return {
     source_url: url,
     source_site: detectSite(url),
-    title: typeof parsed.title === "string" && parsed.title.trim() ? parsed.title.trim() : "Receita sem título",
+    title: title.slice(0, 200),
     description: typeof parsed.description === "string" ? parsed.description.trim() : null,
     author: (jsonLdAuthor ?? aiAuthor)?.slice(0, 120) ?? null,
     servings: coerceInt(parsed.servings) ?? 4,
@@ -285,8 +352,6 @@ export async function persistExtractedRecipe(params: {
     .single();
 
   if (error) {
-    // Unique-violation on source_url means another concurrent import
-    // already saved this recipe. Return the existing id instead of throwing.
     if ((error as any).code === "23505" && recipe.source_url) {
       const { data: existingRow } = await supabase
         .from("recipes")
@@ -295,9 +360,9 @@ export async function persistExtractedRecipe(params: {
         .maybeSingle();
       if (existingRow?.id) return { id: existingRow.id };
     }
+    console.error(`[persist] erro Supabase ao inserir ${recipe.source_url}:`, error.message);
     throw new Error(error.message);
   }
-
 
   if (recipe.ingredients.length > 0) {
     const names = Array.from(new Set(recipe.ingredients.map((i) => i.name.trim().toLowerCase())));
