@@ -65,7 +65,7 @@ export async function runBulkImport(params: {
 }): Promise<BulkImportResult> {
   const { site, config, limit, userId, supabase } = params;
   const maxMillis = params.maxMillis ?? 8500;
-  const pauseMs = params.pauseMs ?? 5000; // ~12 receitas/min, dentro do free tier
+  const pauseMs = params.pauseMs ?? 8000; // ~12 receitas/min, dentro do free tier
   const started = Date.now();
   const deadline = started + maxMillis;
 
