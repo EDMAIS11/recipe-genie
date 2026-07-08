@@ -40,14 +40,33 @@ export function siteKeyFromHost(host: string): string {
   }
 }
 
+// Resolve/reject `p` but never take longer than `ms`. The underlying request
+// keeps running in the background if it loses the race, but it is abandoned
+// once the function returns — the important thing is that we return in time.
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return Promise.race([
+    p,
+    new Promise<T>((_, reject) =>
+      setTimeout(() => reject(new Error(`timeout (${ms}ms) em ${label}`)), ms),
+    ),
+  ]);
+}
+
 export async function runBulkImport(params: {
   site: string;
   config: BulkImportConfig;
   limit: number;
   userId: string;
   supabase: any;
+  // Orçamento de tempo total. Default seguro para uma função síncrona do
+  // Netlify (limite 10s). Numa background function podes passar, ex., 800000.
+  maxMillis?: number;
 }): Promise<BulkImportResult> {
   const { site, config, limit, userId, supabase } = params;
+  const maxMillis = params.maxMillis ?? 8500;
+  const CONCURRENCY = 3; // scrapes em paralelo por lote (conservador p/ o Jina)
+  const started = Date.now();
+  const deadline = started + maxMillis;
 
   const aiKey = process.env.AI_API_KEY;
   if (!aiKey) throw new Error("AI_API_KEY em falta");
@@ -58,7 +77,6 @@ export async function runBulkImport(params: {
     pathIncludes: config.pathIncludes,
     limit: 500,
   });
-
   const includes = config.pathIncludes.length > 0 ? config.pathIncludes : [""];
   const recipeUrls = Array.from(
     new Set(rawLinks.filter((u: string) => includes.some((p) => u.includes(p)))),
@@ -80,29 +98,48 @@ export async function runBulkImport(params: {
     failed: 0,
     errors: [],
   };
-
   if (toImport.length === 0) return result;
 
-  // Jina has no batch endpoint, so scrape each URL individually. Recipe pages
-  // need the raw HTML too (the extractor gates on a Recipe JSON-LD schema).
-  for (const url of toImport) {
-    try {
-      const { markdown, html: rawHtml, metadata } = await jinaScrape(url, {
-        includeHtml: true,
-      });
-      if (!markdown) {
-        result.failed++;
-        result.errors.push({ url, error: "sem markdown" });
-        continue;
-      }
-      const recipe = await extractRecipeFromMarkdown({ url, markdown, rawHtml, metadata, aiKey });
-      await persistExtractedRecipe({ recipe, userId, supabase });
-      result.imported++;
-    } catch (e: any) {
-      result.failed++;
-      result.errors.push({ url, error: e?.message ?? String(e) });
-    }
+  async function importOne(url: string, budgetMs: number): Promise<void> {
+    const { markdown, html: rawHtml, metadata } = await jinaScrape(url, {
+      includeHtml: true,
+    });
+    if (!markdown) throw new Error("sem markdown");
+    const recipe = await extractRecipeFromMarkdown({ url, markdown, rawHtml, metadata, aiKey });
+    await persistExtractedRecipe({ recipe, userId, supabase });
   }
+
+  // Processa em lotes concorrentes, parando quando o orçamento de tempo acaba.
+  // O que não for importado nesta corrida fica para a próxima (o agendador de
+  // 30 min continua a esgotar a fila, e os duplicados já são ignorados).
+  for (let i = 0; i < toImport.length; i += CONCURRENCY) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 1500) break; // não vale a pena começar outro lote
+    const batch = toImport.slice(i, i + CONCURRENCY);
+
+    const settled = await Promise.allSettled(
+      batch.map((url) => withTimeout(importOne(url, remaining), remaining, url)),
+    );
+
+    settled.forEach((s, idx) => {
+      if (s.status === "fulfilled") {
+        result.imported++;
+      } else {
+        result.failed++;
+        result.errors.push({
+          url: batch[idx],
+          error: s.reason?.message ?? String(s.reason),
+        });
+      }
+    });
+  }
+
+  console.error(
+    `[bulkImport] ${site}: descobertos=${result.discovered} importados=${result.imported} ` +
+      `falhas=${result.failed} em ${Date.now() - started}ms (fila restante ~${
+        toImport.length - result.imported - result.failed
+      })`,
+  );
 
   return result;
 }
