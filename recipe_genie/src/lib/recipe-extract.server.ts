@@ -173,15 +173,13 @@ export async function extractRecipeFromMarkdown(params: {
 }): Promise<ExtractedRecipe> {
   const { url, markdown, rawHtml, metadata, aiKey } = params;
 
-  // Guard: only accept pages that expose a Recipe JSON-LD schema. Hub /
-  // collection pages (e.g. jamieoliver.com/recipes/christmas) look like
-  // recipes to the AI (they render featured cards) and produce duplicated,
-  // mismatched entries. If there's no Recipe schema, this URL is not a
-  // real recipe page.
-  const recipeNode = findRecipeJsonLd(rawHtml);
-  if (!recipeNode) {
-    throw new Error("Página não é uma receita (sem schema Recipe).");
-  }
+  // JSON-LD é usado como BÓNUS (imagem/autor) quando existe — mas NÃO como
+  // porteiro. O Jina devolve HTML limpo para leitura e costuma remover os
+  // <script>, incluindo o ld+json, por isso exigi-lo rejeitaria páginas de
+  // receita legítimas. A descoberta já filtra por caminho (/receita/), e mais
+  // abaixo validamos o RESULTADO da extração (título + ingredientes) para
+  // apanhar eventuais páginas-índice.
+  const hasJsonLd = !!findRecipeJsonLd(rawHtml);
 
   const jsonLdImage = pickImageFromJsonLd(rawHtml);
   const jsonLdAuthor = pickAuthorFromJsonLd(rawHtml);
@@ -197,15 +195,26 @@ export async function extractRecipeFromMarkdown(params: {
   const gateway = createAiProvider(aiKey);
   const model = gateway(process.env.AI_MODEL || "gemini-2.5-flash");
 
-  const { text } = await generateText({
-    model,
-    system: SYSTEM_PROMPT,
-    prompt: `URL: ${url}\n\nMarkdown:\n${markdown.slice(0, 15000)}`,
-  });
-
+  let text = "";
+  try {
+    const out = await generateText({
+      model,
+      system: SYSTEM_PROMPT,
+      prompt: `URL: ${url}\n\nMarkdown:\n${markdown.slice(0, 15000)}`,
+    });
+    text = out.text;
+  } catch (err: any) {
+    console.error(`[extract] falha na chamada ao modelo para ${url}:`, err?.message ?? err);
+    throw new Error(`Chamada ao modelo falhou: ${err?.message ?? String(err)}`);
+  }
 
   const parsed = extractJson(text);
   if (!parsed || typeof parsed !== "object") {
+    console.error(
+      `[extract] resposta não-JSON para ${url} (len=${text?.length ?? 0}) head=${JSON.stringify(
+        (text ?? "").slice(0, 200),
+      )}`,
+    );
     throw new Error("Não foi possível extrair a receita (resposta não-JSON).");
   }
 
@@ -232,10 +241,23 @@ export async function extractRecipeFromMarkdown(params: {
       ? parsed.author.trim().slice(0, 120)
       : null;
 
+  const title =
+    typeof parsed.title === "string" && parsed.title.trim() ? parsed.title.trim() : null;
+
+  // Validação de resultado: uma página de receita real tem título e alguns
+  // ingredientes. Se não tiver, é quase de certeza uma página-índice/coleção.
+  if (!title || ingredients.length < 2) {
+    throw new Error(
+      `Não parece uma receita (título=${title ? "sim" : "não"}, ingredientes=${ingredients.length}${
+        hasJsonLd ? "" : ", sem JSON-LD"
+      }).`,
+    );
+  }
+
   return {
     source_url: url,
     source_site: detectSite(url),
-    title: typeof parsed.title === "string" && parsed.title.trim() ? parsed.title.trim() : "Receita sem título",
+    title: title.slice(0, 200),
     description: typeof parsed.description === "string" ? parsed.description.trim() : null,
     author: (jsonLdAuthor ?? aiAuthor)?.slice(0, 120) ?? null,
     servings: coerceInt(parsed.servings) ?? 4,
@@ -295,9 +317,9 @@ export async function persistExtractedRecipe(params: {
         .maybeSingle();
       if (existingRow?.id) return { id: existingRow.id };
     }
+    console.error(`[persist] erro Supabase ao inserir ${recipe.source_url}:`, error.message);
     throw new Error(error.message);
   }
-
 
   if (recipe.ingredients.length > 0) {
     const names = Array.from(new Set(recipe.ingredients.map((i) => i.name.trim().toLowerCase())));
