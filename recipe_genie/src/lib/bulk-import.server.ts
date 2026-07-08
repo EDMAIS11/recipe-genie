@@ -126,10 +126,9 @@ export async function runBulkImport(params: {
         result.imported++;
       } else {
         result.failed++;
-        result.errors.push({
-          url: batch[idx],
-          error: s.reason?.message ?? String(s.reason),
-        });
+        const msg = s.reason?.message ?? String(s.reason);
+        result.errors.push({ url: batch[idx], error: msg });
+        console.error(`[bulkImport] FALHA ${batch[idx]}: ${msg}`);
       }
     });
   }
