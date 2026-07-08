@@ -10,6 +10,7 @@ function isNewSupabaseApiKey(value: string): boolean {
 }
 
 function createSupabaseFetch(supabaseKey: string): typeof fetch {
+  const isLegacyJwt = supabaseKey.startsWith('eyJ');
   return (input, init) => {
     const headers = new Headers(
       typeof Request !== 'undefined' && input instanceof Request ? input.headers : undefined,
@@ -22,6 +23,13 @@ function createSupabaseFetch(supabaseKey: string): typeof fetch {
     // New Supabase API keys are opaque strings, not bearer JWTs.
     if (isNewSupabaseApiKey(supabaseKey) && headers.get('Authorization') === `Bearer ${supabaseKey}`) {
       headers.delete('Authorization');
+    }
+
+    // Legacy JWT keys (eyJ...) MUST travel in Authorization: Bearer besides the
+    // apikey header. When there's no user session (e.g. a background function),
+    // nothing else sets it, so we set it here to avoid "Invalid API key".
+    if (isLegacyJwt && !headers.has('Authorization')) {
+      headers.set('Authorization', `Bearer ${supabaseKey}`);
     }
 
     headers.set('apikey', supabaseKey);
