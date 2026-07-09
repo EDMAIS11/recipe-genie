@@ -153,11 +153,16 @@ function RecipesPage() {
 
   const categoryCounts = useMemo(() => {
     const m = new Map<string, number>();
-    for (const paths of pathsMap.values()) {
+    for (const r of q.data ?? []) {
+      // Respeitar o filtro de chef: se há um chef selecionado, só contam as
+      // receitas dele. Assim a árvore de categorias reflecte o chef escolhido.
+      if (authorFilter && r.author !== authorFilter) continue;
+      const paths = pathsMap.get(r.id);
+      if (!paths) continue;
       for (const p of paths) m.set(p, (m.get(p) ?? 0) + 1);
     }
     return m;
-  }, [pathsMap]);
+  }, [q.data, pathsMap, authorFilter]);
 
   const authors = useMemo(() => {
     const set = new Map<string, number>();
@@ -179,6 +184,13 @@ function RecipesPage() {
     }
     return { total, fav, exc, unmarked: total - fav - exc };
   }, [q.data, prefMap]);
+
+  // Total que respeita o chef seleccionado — usado no "Todas" da barra lateral.
+  const authorTotal = useMemo(() => {
+    const rows = q.data ?? [];
+    if (!authorFilter) return rows.length;
+    return rows.filter((r) => r.author === authorFilter).length;
+  }, [q.data, authorFilter]);
 
   const filtered = useMemo(() => {
     let rows = q.data ?? [];
@@ -280,7 +292,7 @@ function RecipesPage() {
               categoryPath === null ? "bg-primary text-primary-foreground" : "hover:bg-muted"
             }`}
           >
-            Todas ({counts.total})
+            Todas ({authorTotal})
           </button>
           <CategoryTree
             nodes={CATEGORY_TREE}
