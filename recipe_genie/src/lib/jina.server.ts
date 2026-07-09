@@ -93,15 +93,20 @@ export async function discoverUrlsFromSitemap(
 ): Promise<string[]> {
   const pathIncludes = opts.pathIncludes ?? [];
   const limit = opts.limit ?? 500;
-  const origin = new URL(host).origin;
   const bareHost = new URL(host).hostname.replace(/^www\./, "");
   const escapedHost = bareHost.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  // Prefer the www host: 24kitchen.pt redirects the bare host to www, so hitting
+  // www directly avoids a redirect hop on every discovery request.
+  const parsed = new URL(host);
+  if (!parsed.hostname.startsWith("www.")) parsed.hostname = "www." + bareHost;
+  const origin = parsed.origin;
 
   // Fetch a URL DIRECTLY, bypassing Jina entirely. Uses a browser user-agent and
   // rejectUnauthorized:false (24kitchen.pt has a cert that doesn't validate on the
-  // normal chain). Confirmed to return the real sitemap.xml (4801 <loc> entries)
-  // for 24kitchen.pt — so URL discovery costs ZERO Jina tokens when this works.
-  function fetchDirect(u: string): Promise<string> {
+  // normal chain). Follows up to 5 redirects — 24kitchen.pt redirects the bare
+  // host (24kitchen.pt) to www.24kitchen.pt, and https.get does NOT follow
+  // redirects on its own. When this works, URL discovery costs ZERO Jina tokens.
+  function fetchDirect(u: string, redirectsLeft = 5): Promise<string> {
     return new Promise((resolve) => {
       const req = https.get(
         u,
@@ -117,21 +122,40 @@ export async function discoverUrlsFromSitemap(
           },
         },
         (res) => {
-          // Only accept clean 2xx responses; anything else is treated as failure
-          // so we fall through to Jina.
-          if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
+          const status = res.statusCode ?? 0;
+
+          // Follow redirects (301/302/303/307/308).
+          if (status >= 300 && status < 400 && res.headers.location) {
+            res.resume(); // drain
+            if (redirectsLeft <= 0) {
+              console.error(`[discoverUrls] fetchDirect ${u}: demasiados redirects`);
+              resolve("");
+              return;
+            }
+            const next = new URL(res.headers.location, u).href;
+            resolve(fetchDirect(next, redirectsLeft - 1));
+            return;
+          }
+
+          if (status < 200 || status >= 300) {
+            console.error(`[discoverUrls] fetchDirect ${u}: HTTP ${status}`);
             res.resume();
             resolve("");
             return;
           }
+
           let body = "";
           res.on("data", (c) => (body += c));
           res.on("end", () => resolve(body));
         },
       );
-      req.on("error", () => resolve(""));
+      req.on("error", (err) => {
+        console.error(`[discoverUrls] fetchDirect ${u}: erro ${err?.message ?? err}`);
+        resolve("");
+      });
       req.setTimeout(15000, () => {
         req.destroy();
+        console.error(`[discoverUrls] fetchDirect ${u}: timeout`);
         resolve("");
       });
     });
