@@ -5,12 +5,22 @@ import { z } from "zod";
 export const listRecipes = createServerFn({ method: "GET" })
   .middleware([requireSupabaseAuth])
   .handler(async ({ context }) => {
-    const { data, error } = await context.supabase
-      .from("recipes")
-      .select("*")
-      .order("created_at", { ascending: false });
-    if (error) throw new Error(error.message);
-    return data ?? [];
+    const PAGE = 1000;
+    let from = 0;
+    const all = [];
+    for (;;) {
+      const { data, error } = await context.supabase
+        .from("recipes")
+        .select("*")
+        .order("created_at", { ascending: false })
+        .range(from, from + PAGE - 1);
+      if (error) throw new Error(error.message);
+      if (!data || data.length === 0) break;
+      all.push(...data);
+      if (data.length < PAGE) break;
+      from += PAGE;
+    }
+    return all;
   });
 
 const CreateRecipeSchema = z.object({

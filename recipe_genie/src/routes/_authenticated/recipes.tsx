@@ -18,6 +18,8 @@ export const Route = createFileRoute("/_authenticated/recipes")({
 const recipesQO = () =>
   queryOptions({
     queryKey: ["recipes"],
+    staleTime: 0,
+    refetchOnMount: "always",
     queryFn: () => listRecipes(),
   });
 
