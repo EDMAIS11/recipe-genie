@@ -6,131 +6,305 @@ import { createAiProvider } from "./ai-gateway.server";
 
 type Suggestion = {
   interpretation: string;
-  sections: Array<{ section: string; picks: Array<{ recipe_id: string; reason: string }> }>;
+  sections: Array<{
+    section: string;
+    picks: Array<{ recipe_id: string; reason: string }>;
+  }>;
 };
 
 function parseSuggestion(text: string): Suggestion | null {
   if (!text) return null;
-  const cleaned = text.replace(/```json\s*/gi, "").replace(/```/g, "").trim();
-  const tryParse = (s: string) => {
-    try { return JSON.parse(s); } catch { return null; }
+
+  const cleaned = text
+    .replace(/```json\s*/gi, "")
+    .replace(/```/g, "")
+    .trim();
+
+  const tryParse = (value: string) => {
+    try {
+      return JSON.parse(value);
+    } catch {
+      return null;
+    }
   };
+
   let parsed: any = tryParse(cleaned);
+
   if (!parsed) {
-    const a = cleaned.indexOf("{");
-    const b = cleaned.lastIndexOf("}");
-    if (a >= 0 && b > a) parsed = tryParse(cleaned.slice(a, b + 1));
+    const firstBrace = cleaned.indexOf("{");
+    const lastBrace = cleaned.lastIndexOf("}");
+
+    if (firstBrace >= 0 && lastBrace > firstBrace) {
+      parsed = tryParse(cleaned.slice(firstBrace, lastBrace + 1));
+    }
   }
+
   if (!parsed || typeof parsed !== "object") return null;
+
   const sections = Array.isArray(parsed.sections) ? parsed.sections : [];
+
   return {
-    interpretation: typeof parsed.interpretation === "string" ? parsed.interpretation : "",
-    sections: sections.map((s: any) => ({
-      section: String(s?.section ?? ""),
-      picks: Array.isArray(s?.picks)
-        ? s.picks
-            .filter((p: any) => p && typeof p.recipe_id === "string")
-            .map((p: any) => ({ recipe_id: p.recipe_id, reason: String(p.reason ?? "") }))
+    interpretation:
+      typeof parsed.interpretation === "string"
+        ? parsed.interpretation
+        : "",
+    sections: sections.map((section: any) => ({
+      section: String(section?.section ?? ""),
+      picks: Array.isArray(section?.picks)
+        ? section.picks
+            .filter(
+              (pick: any) =>
+                pick && typeof pick.recipe_id === "string",
+            )
+            .map((pick: any) => ({
+              recipe_id: pick.recipe_id,
+              reason: String(pick.reason ?? ""),
+            }))
         : [],
     })),
   };
 }
 
+function selectRecipesForAi<
+  T extends {
+    id: string;
+    title?: string | null;
+    meal_type?: string | null;
+  },
+>(recipes: T[], favoriteIds: Set<string>): T[] {
+  const ordered = [...recipes].sort((left, right) => {
+    const favoriteDifference =
+      Number(favoriteIds.has(right.id)) -
+      Number(favoriteIds.has(left.id));
+
+    if (favoriteDifference !== 0) return favoriteDifference;
+
+    return String(left.title ?? "").localeCompare(
+      String(right.title ?? ""),
+      "pt",
+    );
+  });
+
+  const selected: T[] = [];
+  const selectedIds = new Set<string>();
+
+  const addRecipes = (candidates: T[], limit: number) => {
+    for (const recipe of candidates) {
+      if (selected.length >= 120 || limit <= 0) break;
+      if (selectedIds.has(recipe.id)) continue;
+
+      selected.push(recipe);
+      selectedIds.add(recipe.id);
+      limit -= 1;
+    }
+  };
+
+  // Mantém variedade suficiente para os três tipos usados no plano semanal.
+  for (const mealType of [
+    "entrada",
+    "prato_principal",
+    "sobremesa",
+  ]) {
+    addRecipes(
+      ordered.filter((recipe) => recipe.meal_type === mealType),
+      35,
+    );
+  }
+
+  // Preenche os lugares restantes com bebidas, acompanhamentos, snacks
+  // ou mais receitas dos tipos principais.
+  addRecipes(ordered, 120 - selected.length);
+
+  return selected;
+}
+
+function friendlyAiError(error: unknown): Error {
+  const rawMessage =
+    error instanceof Error ? error.message : String(error ?? "");
+
+  if (
+    /timeout|timed out|deadline|aborted|504|gateway/i.test(rawMessage)
+  ) {
+    return new Error(
+      "A geração demorou demasiado. Tenta novamente; o plano semanal será gerado um dia de cada vez.",
+    );
+  }
+
+  if (/<html|inactivity timeout/i.test(rawMessage)) {
+    return new Error(
+      "O servidor não conseguiu concluir a geração dentro do tempo permitido.",
+    );
+  }
+
+  return new Error(
+    rawMessage || "Não foi possível obter sugestões da IA.",
+  );
+}
 
 export const suggestMeals = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((input: unknown) =>
-    z.object({ prompt: z.string().min(3).max(1000) }).parse(input),
+    z
+      .object({
+        prompt: z.string().min(3).max(1000),
+        targetSection: z.string().min(2).max(50).optional(),
+        excludeRecipeIds: z
+          .array(z.string().min(1).max(100))
+          .max(100)
+          .optional(),
+      })
+      .parse(input),
   )
   .handler(async ({ data, context }) => {
-    // Exclude recipes the user marked as excluded; boost favorites in the prompt.
-    const { data: prefs } = await context.supabase
+    const { data: preferences } = await context.supabase
       .from("recipe_preferences")
       .select("recipe_id, status")
       .eq("user_id", context.userId);
-    const excludedIds = new Set(
-      (prefs ?? []).filter((p) => p.status === "excluded").map((p) => p.recipe_id),
-    );
+
+    const excludedIds = new Set<string>([
+      ...(preferences ?? [])
+        .filter((preference) => preference.status === "excluded")
+        .map((preference) => preference.recipe_id),
+      ...(data.excludeRecipeIds ?? []),
+    ]);
+
     const favoriteIds = new Set(
-      (prefs ?? []).filter((p) => p.status === "favorite").map((p) => p.recipe_id),
+      (preferences ?? [])
+        .filter((preference) => preference.status === "favorite")
+        .map((preference) => preference.recipe_id),
     );
 
     const { data: allRecipes, error } = await context.supabase
       .from("recipes")
-      .select("id,title,description,meal_type,cuisine_style,tags,servings,estimated_cost_per_serving,calories_per_serving,source_site,source_url,image_url")
+      .select(
+        "id,title,meal_type,cuisine_style,tags,estimated_cost_per_serving,calories_per_serving,source_url,image_url",
+      )
       .limit(300);
+
     if (error) throw new Error(error.message);
 
-    const recipes = (allRecipes ?? []).filter((r) => !excludedIds.has(r.id));
+    const availableRecipes = (allRecipes ?? []).filter(
+      (recipe) => !excludedIds.has(recipe.id),
+    );
 
-    if (!recipes || recipes.length === 0) {
+    if (availableRecipes.length === 0) {
       return {
-        interpretation: "Ainda não tens receitas guardadas (ou estão todas excluídas).",
+        interpretation:
+          "Ainda não tens receitas disponíveis para este pedido.",
         sections: [],
         recipes: [],
       };
     }
 
-
     const apiKey = process.env.AI_API_KEY;
     if (!apiKey) throw new Error("Missing AI_API_KEY");
 
     const gateway = createAiProvider(apiKey);
-    const model = gateway(process.env.AI_MODEL || "gemini-2.5-flash");
+    const model = gateway(
+      process.env.AI_MODEL || "gemini-2.5-flash",
+    );
 
-    const catalog = recipes.map((r) => ({
-      id: r.id,
-      title: r.title,
-      meal_type: r.meal_type,
-      cuisine: r.cuisine_style,
-      tags: r.tags,
-      cost_per_serving: r.estimated_cost_per_serving,
-      calories: r.calories_per_serving,
-      favorite: favoriteIds.has(r.id),
+    // A IA recebe no máximo 120 receitas, em vez das 300 completas.
+    const recipes = selectRecipesForAi(
+      availableRecipes,
+      favoriteIds,
+    );
+
+    const catalog = recipes.map((recipe) => ({
+      id: recipe.id,
+      title: recipe.title,
+      meal_type: recipe.meal_type,
+      cuisine: recipe.cuisine_style,
+      tags: recipe.tags,
+      cost_per_serving: recipe.estimated_cost_per_serving,
+      calories: recipe.calories_per_serving,
+      favorite: favoriteIds.has(recipe.id),
     }));
 
-    const systemPrompt = `És um chef assistente. Sugeres refeições em português a partir de um catálogo de receitas.
-Interpretas o pedido (nº pessoas, orçamento POR PESSOA, estilo, exclusões, secções pretendidas).
-REGRAS OBRIGATÓRIAS:
-- Devolves SEMPRE pelo menos 2 propostas por cada secção pedida, mesmo que tenhas de relaxar o orçamento em até 30% ou o estilo. NUNCA devolvas sections vazio se houver receitas no catálogo.
-- Usa o meal_type do catálogo para escolher: "entrada" para entradas, "prato_principal" para pratos principais, "sobremesa" para sobremesas.
-- Só podes usar receitas do catálogo fornecido (usa o campo id exatamente como aparece).
-- Dá preferência a receitas com favorite=true quando encaixarem.
-- Custo é POR PESSOA (cost_per_serving). Compara com o orçamento por pessoa do pedido.
-- Se relaxares algum critério, diz-o na interpretation.
-- PLANEAMENTO SEMANAL: se o pedido falar em organizar/planear refeições da semana (palavras como "semana", "semanal", "segunda a sexta", "dias úteis", "meal prep"), devolve EXATAMENTE 5 secções com os nomes "Segunda-feira", "Terça-feira", "Quarta-feira", "Quinta-feira", "Sexta-feira" (nesta ordem). Se o pedido pedir explicitamente "toda a semana" ou "7 dias" inclui também "Sábado" e "Domingo".
-- DUAS OPÇÕES POR TIPO: em cada dia (ou em cada secção genérica pedida), devolve 2 opções POR CADA TIPO de prato relevante. Por defeito num dia semanal: 2 entradas + 2 pratos principais + 2 sobremesas (6 picks por dia). Se o pedido só mencionar "prato principal" ou "almoço rápido", devolve apenas 2 pratos principais. Nunca repitas a mesma receita entre dias.`;
+    const planningRules = data.targetSection
+      ? `MODO DE GERAÇÃO PARCIAL:
+- Gera APENAS o dia/secção "${data.targetSection}".
+- Devolve EXATAMENTE uma secção com o nome "${data.targetSection}".
+- Não devolvas os restantes dias da semana.
+- Por defeito, nesse dia devolve 2 entradas + 2 pratos principais + 2 sobremesas.
+- Se o pedido original limitar explicitamente os tipos de prato, respeita essa limitação.
+- As receitas usadas em dias anteriores já foram removidas do catálogo; não inventes IDs.`
+      : `PLANEAMENTO SEMANAL:
+- Se o pedido falar em organizar/planear refeições da semana (por exemplo "semana", "semanal", "segunda a sexta", "dias úteis" ou "meal prep"), devolve EXATAMENTE 5 secções: "Segunda-feira", "Terça-feira", "Quarta-feira", "Quinta-feira" e "Sexta-feira", nesta ordem.
+- Se o pedido disser explicitamente "toda a semana", "7 dias", "sete dias" ou "segunda a domingo", inclui também "Sábado" e "Domingo".
+- Em cada dia devolve, por defeito, 2 entradas + 2 pratos principais + 2 sobremesas.
+- Se o pedido só mencionar um tipo, como "prato principal" ou "almoço rápido", devolve apenas 2 pratos principais.
+- Nunca repitas a mesma receita entre dias.`;
 
-    const userPrompt = `Pedido do utilizador: "${data.prompt}"
+    const systemPrompt = `És um chef assistente. Sugeres refeições em português de Portugal a partir de um catálogo de receitas.
+
+Interpretas o pedido: número de pessoas, orçamento POR PESSOA, estilo, exclusões e tipos de prato pretendidos.
+
+REGRAS OBRIGATÓRIAS:
+- Devolve pelo menos 2 propostas por cada tipo de prato pedido, desde que existam receitas desse tipo no catálogo.
+- Podes relaxar o orçamento em até 30% ou o estilo, mas tens de indicar isso na interpretation.
+- Usa meal_type="entrada" para entradas, meal_type="prato_principal" para pratos principais e meal_type="sobremesa" para sobremesas.
+- Só podes usar receitas do catálogo fornecido.
+- Copia o campo id exatamente como aparece no catálogo.
+- Dá preferência a favorite=true quando a receita cumprir o pedido.
+- cost_per_serving é sempre o custo POR PESSOA.
+- Não inventes receitas, preços, calorias nem IDs.
+- Não devolvas uma secção vazia quando existirem receitas adequadas no catálogo.
+
+${planningRules}`;
+
+    const expectedSection = data.targetSection ?? "entrada";
+
+    const userPrompt = `Pedido original do utilizador:
+"${data.prompt}"
+
+${data.targetSection ? `Parte a gerar agora: "${data.targetSection}"` : ""}
 
 Catálogo (${catalog.length} receitas, JSON):
 ${JSON.stringify(catalog)}
 
-Responde EXCLUSIVAMENTE com um objeto JSON válido (sem markdown, sem \`\`\`), no formato:
-{"interpretation": "...", "sections": [{"section": "entrada", "picks": [{"recipe_id": "uuid", "reason": "..."}, ...]}]}`;
+Responde EXCLUSIVAMENTE com um objeto JSON válido, sem markdown e sem blocos de código, neste formato:
+{"interpretation":"...","sections":[{"section":"${expectedSection}","picks":[{"recipe_id":"uuid","reason":"..."}]}]}`;
 
-    const { text } = await generateText({
-      model,
-      system: systemPrompt,
-      prompt: userPrompt,
-    });
+    let text: string;
+
+    try {
+      const generated = await generateText({
+        model,
+        system: systemPrompt,
+        prompt: userPrompt,
+        temperature: 0.25,
+        maxOutputTokens: data.targetSection ? 1200 : 1800,
+        maxRetries: 1,
+        timeout: 45_000,
+      });
+
+      text = generated.text;
+    } catch (error) {
+      throw friendlyAiError(error);
+    }
 
     const parsed = parseSuggestion(text);
+
     if (!parsed) {
       return {
-        interpretation: "Não foi possível gerar sugestões estruturadas.",
+        interpretation:
+          "Não foi possível interpretar a resposta da IA.",
         sections: [],
         recipes,
       };
     }
 
-    const validIds = new Set(recipes.map((r) => r.id));
+    const validIds = new Set(recipes.map((recipe) => recipe.id));
+
     const cleanedSections = parsed.sections
-      .map((s) => ({
-        section: s.section,
-        picks: s.picks.filter((p) => validIds.has(p.recipe_id)).slice(0, 8),
+      .map((section) => ({
+        section: data.targetSection || section.section,
+        picks: section.picks
+          .filter((pick) => validIds.has(pick.recipe_id))
+          .slice(0, 8),
       }))
-      .filter((s) => s.picks.length > 0);
+      .filter((section) => section.picks.length > 0);
 
     return {
       interpretation: parsed.interpretation || "",
@@ -138,4 +312,3 @@ Responde EXCLUSIVAMENTE com um objeto JSON válido (sem markdown, sem \`\`\`), n
       recipes,
     };
   });
-
