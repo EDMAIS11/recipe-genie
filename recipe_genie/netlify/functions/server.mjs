@@ -22,3 +22,5 @@ export const config = {
   path: "/*",
   preferStatic: true,
 };
+
+// Force Netlify function rebuild: 2026-07-11
