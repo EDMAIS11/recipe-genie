@@ -1,7 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useServerFn } from "@tanstack/react-start";
 import { queryOptions, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 import { Plus, Trash2, ExternalLink, Wallet, Flame, Users, Loader2, Link as LinkIcon, Sparkles, Download, Heart, Ban, Play, Pause, Clock, ChevronRight, ChevronDown } from "lucide-react";
 import { listRecipes, createRecipe, deleteRecipe } from "@/lib/recipes.functions";
@@ -204,6 +204,32 @@ function RecipesPage() {
     return rows.filter((r) => prefMap.get(r.id) === filter);
   }, [q.data, prefMap, filter, authorFilter, categoryPath, pathsMap]);
 
+  // Renderização incremental: mostra 24 cartões de cada vez e vai carregando
+  // mais à medida que o utilizador desce a página (infinite scroll).
+  const [visibleCount, setVisibleCount] = useState(24);
+  useEffect(() => {
+    // Ao mudar de filtro/categoria/chef, recomeça nos primeiros 24.
+    setVisibleCount(24);
+  }, [filtered]);
+
+  const sentinelRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const el = sentinelRef.current;
+    if (!el) return;
+    const obs = new IntersectionObserver(
+      (entries) => {
+        if (entries[0]?.isIntersecting) {
+          setVisibleCount((c) => Math.min(c + 24, filtered.length));
+        }
+      },
+      { rootMargin: "600px" },
+    );
+    obs.observe(el);
+    return () => obs.disconnect();
+  }, [filtered.length, visibleCount]);
+
+  const visible = filtered.slice(0, visibleCount);
+
   return (
     <div>
       <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
@@ -316,10 +342,15 @@ function RecipesPage() {
             </div>
           )}
           <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-3">
-            {filtered.map((r) => (
+            {visible.map((r) => (
               <RecipeCard key={r.id} r={r} pref={prefMap.get(r.id) ?? null} />
             ))}
           </div>
+          {visibleCount < filtered.length && (
+            <div ref={sentinelRef} className="flex items-center justify-center py-6 text-muted-foreground" aria-hidden="true">
+              <Loader2 className="h-5 w-5 animate-spin" />
+            </div>
+          )}
         </div>
       </div>
     </div>
@@ -931,4 +962,3 @@ function ImportRecipe({ onDone }: { onDone: () => void }) {
     </div>
   );
 }
-
