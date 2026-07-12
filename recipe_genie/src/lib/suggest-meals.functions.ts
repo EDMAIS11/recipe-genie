@@ -79,6 +79,8 @@ type PoolRecipe = {
   title: string | null;
   meal_type: string | null;
   tags: string[] | null;
+  source_site: string | null;
+  author: string | null;
 };
 
 function normalizeText(value: string): string {
@@ -171,6 +173,29 @@ function themeForDay(targetSection: string): string | null {
   return BASE_ROTATION[(dayIndex + shift) % BASE_ROTATION.length];
 }
 
+// Reforço do sorteio: receitas cujo site de origem ou autor é mencionado
+// no pedido ou nas preferências entram com peso extra na amostra (peso 3;
+// favoritas mantêm peso 2; ambas acumulam). Não é filtro: só enviesa.
+function buildBoostedIds(pool: PoolRecipe[], texts: string[]): Set<string> {
+  const haystack = normalizeText(texts.join(" "));
+  const boosted = new Set<string>();
+  if (haystack.length < 4) return boosted;
+  for (const recipe of pool) {
+    const site = normalizeText(recipe.source_site ?? "")
+      .replace(/^https?:\/\//, "")
+      .replace(/^www\./, "");
+    const siteName = site.split(".")[0] ?? "";
+    const author = normalizeText(recipe.author ?? "");
+    if (
+      (siteName.length >= 5 && haystack.includes(siteName)) ||
+      (author.length >= 5 && haystack.includes(author))
+    ) {
+      boosted.add(recipe.id);
+    }
+  }
+  return boosted;
+}
+
 // Amostra aleatória com peso 2 para favoritas: cada favorita entra duas
 // vezes no sorteio, ou seja, tem o dobro da probabilidade de ser escolhida
 // (mas nunca é garantida).
@@ -178,11 +203,16 @@ function sampleCandidates(
   pool: PoolRecipe[],
   favoriteIds: Set<string>,
   count: number,
+  boostedIds: Set<string> = new Set(),
 ): PoolRecipe[] {
   const weighted: PoolRecipe[] = [];
   for (const recipe of pool) {
     weighted.push(recipe);
     if (favoriteIds.has(recipe.id)) weighted.push(recipe);
+    if (boostedIds.has(recipe.id)) {
+      weighted.push(recipe);
+      weighted.push(recipe);
+    }
   }
   const picked: PoolRecipe[] = [];
   const pickedIds = new Set<string>();
@@ -286,7 +316,7 @@ export const suggestMeals = createServerFn({ method: "POST" })
     //    Nota: receitas sem meal_type canónico ficam fora do sorteio.
     const { data: poolRows, error: poolError } = await context.supabase
       .from("recipes")
-      .select("id,title,meal_type,tags")
+      .select("id,title,meal_type,tags,source_site,author")
       .in("meal_type", [
         "entrada",
         "prato_principal",
@@ -313,6 +343,8 @@ export const suggestMeals = createServerFn({ method: "POST" })
     const byType = (mealType: string) =>
       pool.filter((recipe) => recipe.meal_type === mealType);
 
+    const boostedIds = buildBoostedIds(pool, [data.prompt, userPrefs]);
+
     // 2) Tema do dia (só nos dias úteis do plano semanal).
     const theme = data.targetSection
       ? themeForDay(data.targetSection)
@@ -334,17 +366,17 @@ export const suggestMeals = createServerFn({ method: "POST" })
     }
 
     candidates.push(
-      ...sampleCandidates(byType("entrada"), favoriteIds, 16),
-      ...sampleCandidates(themedMains, favoriteIds, 20),
-      ...sampleCandidates(byType("sobremesa"), favoriteIds, 16),
+      ...sampleCandidates(byType("entrada"), favoriteIds, 16, boostedIds),
+      ...sampleCandidates(themedMains, favoriteIds, 20, boostedIds),
+      ...sampleCandidates(byType("sobremesa"), favoriteIds, 16, boostedIds),
     );
 
     // Nos pedidos livres (não semanais) junta acompanhamentos e bebidas,
     // porque o pedido pode mencioná-los.
     if (!data.targetSection) {
       candidates.push(
-        ...sampleCandidates(byType("acompanhamento"), favoriteIds, 6),
-        ...sampleCandidates(byType("bebida"), favoriteIds, 6),
+        ...sampleCandidates(byType("acompanhamento"), favoriteIds, 6, boostedIds),
+        ...sampleCandidates(byType("bebida"), favoriteIds, 6, boostedIds),
       );
     }
 
@@ -543,7 +575,7 @@ export const swapSuggestion = createServerFn({ method: "POST" })
     // Pool só do tipo de prato a trocar, sem as receitas já visíveis.
     const { data: poolRows, error: poolError } = await context.supabase
       .from("recipes")
-      .select("id,title,meal_type,tags")
+      .select("id,title,meal_type,tags,source_site,author")
       .eq("meal_type", data.mealType);
 
     if (poolError) throw new Error(poolError.message);
@@ -567,7 +599,8 @@ export const swapSuggestion = createServerFn({ method: "POST" })
       if (themed.length >= 5) pool = themed;
     }
 
-    const candidates = sampleCandidates(pool, favoriteIds, 16);
+    const boostedIds = buildBoostedIds(pool, [data.prompt, userPrefs]);
+    const candidates = sampleCandidates(pool, favoriteIds, 16, boostedIds);
     const candidateIds = candidates.map((recipe) => recipe.id);
 
     const { data: detailRows, error: detailError } = await context.supabase
