@@ -18,8 +18,7 @@ export const Route = createFileRoute("/_authenticated/recipes")({
 const recipesQO = () =>
   queryOptions({
     queryKey: ["recipes"],
-    staleTime: 0,
-    refetchOnMount: "always",
+    staleTime: 5 * 60_000,
     queryFn: () => listRecipes(),
   });
 
@@ -101,9 +100,14 @@ function recipeText(r: any): string {
 // "atum" doesn't match "atumultuado". Boundaries here mean start/end
 // of the string or any non-letter character (accented chars count as letters).
 const LETTER = "a-záàâãäéèêëíìîïóòôõöúùûüçñ";
+const REGEX_CACHE = new Map<string, RegExp>();
 function wordMatch(text: string, key: string): boolean {
-  const k = key.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  const re = new RegExp(`(^|[^${LETTER}])${k}(?![${LETTER}])`, "i");
+  let re = REGEX_CACHE.get(key);
+  if (!re) {
+    const k = key.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    re = new RegExp(`(^|[^${LETTER}])${k}(?![${LETTER}])`, "i");
+    REGEX_CACHE.set(key, re);
+  }
   return re.test(text);
 }
 
