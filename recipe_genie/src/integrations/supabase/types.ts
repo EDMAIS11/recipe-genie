@@ -59,6 +59,195 @@ export type Database = {
         }
         Relationships: []
       }
+      ingredient_aliases: {
+        Row: {
+          alias: string
+          created_at: string
+          id: string
+          ingredient_id: string
+          normalized_alias: string
+          source_site: string | null
+        }
+        Insert: {
+          alias: string
+          created_at?: string
+          id?: string
+          ingredient_id: string
+          normalized_alias: string
+          source_site?: string | null
+        }
+        Update: {
+          alias?: string
+          created_at?: string
+          id?: string
+          ingredient_id?: string
+          normalized_alias?: string
+          source_site?: string | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "ingredient_aliases_ingredient_id_fkey"
+            columns: ["ingredient_id"]
+            isOneToOne: false
+            referencedRelation: "ingredients"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
+      ingredient_harmonization_backups: {
+        Row: {
+          backed_up_at: string
+          row_data: Json
+          row_id: string
+          run_id: string
+          table_name: string
+        }
+        Insert: {
+          backed_up_at?: string
+          row_data: Json
+          row_id: string
+          run_id: string
+          table_name: string
+        }
+        Update: {
+          backed_up_at?: string
+          row_data?: Json
+          row_id?: string
+          run_id?: string
+          table_name?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "ingredient_harmonization_backups_run_id_fkey"
+            columns: ["run_id"]
+            isOneToOne: false
+            referencedRelation: "ingredient_harmonization_runs"
+            referencedColumns: ["run_id"]
+          },
+        ]
+      }
+      ingredient_harmonization_plan: {
+        Row: {
+          alias_rows: number
+          canonical_name: string
+          confidence: string
+          created_at: string
+          current_base_unit: string | null
+          current_category: string | null
+          current_name: string
+          group_conflict: boolean
+          group_id: string
+          group_size: number
+          ingredient_id: string
+          price_rows: number
+          proposed_action: string
+          proposed_base_unit: string
+          proposed_category: string
+          reason: string | null
+          recipe_uses: number
+          requires_review: boolean
+          run_id: string
+          safe_to_apply: boolean
+          shopping_uses: number
+          target_current_name: string
+          target_id: string
+        }
+        Insert: {
+          alias_rows?: number
+          canonical_name: string
+          confidence: string
+          created_at?: string
+          current_base_unit?: string | null
+          current_category?: string | null
+          current_name: string
+          group_conflict: boolean
+          group_id: string
+          group_size?: number
+          ingredient_id: string
+          price_rows?: number
+          proposed_action: string
+          proposed_base_unit: string
+          proposed_category: string
+          reason?: string | null
+          recipe_uses?: number
+          requires_review: boolean
+          run_id: string
+          safe_to_apply: boolean
+          shopping_uses?: number
+          target_current_name: string
+          target_id: string
+        }
+        Update: {
+          alias_rows?: number
+          canonical_name?: string
+          confidence?: string
+          created_at?: string
+          current_base_unit?: string | null
+          current_category?: string | null
+          current_name?: string
+          group_conflict?: boolean
+          group_id?: string
+          group_size?: number
+          ingredient_id?: string
+          price_rows?: number
+          proposed_action?: string
+          proposed_base_unit?: string
+          proposed_category?: string
+          reason?: string | null
+          recipe_uses?: number
+          requires_review?: boolean
+          run_id?: string
+          safe_to_apply?: boolean
+          shopping_uses?: number
+          target_current_name?: string
+          target_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "ingredient_harmonization_plan_run_id_fkey"
+            columns: ["run_id"]
+            isOneToOne: false
+            referencedRelation: "ingredient_harmonization_runs"
+            referencedColumns: ["run_id"]
+          },
+        ]
+      }
+      ingredient_harmonization_runs: {
+        Row: {
+          applied_at: string | null
+          apply_result: Json | null
+          created_at: string
+          plan_rows: number
+          plan_sha256: string
+          preview_result: Json | null
+          previewed_at: string | null
+          run_id: string
+          status: string
+        }
+        Insert: {
+          applied_at?: string | null
+          apply_result?: Json | null
+          created_at?: string
+          plan_rows?: number
+          plan_sha256: string
+          preview_result?: Json | null
+          previewed_at?: string | null
+          run_id?: string
+          status?: string
+        }
+        Update: {
+          applied_at?: string | null
+          apply_result?: Json | null
+          created_at?: string
+          plan_rows?: number
+          plan_sha256?: string
+          preview_result?: Json | null
+          previewed_at?: string | null
+          run_id?: string
+          status?: string
+        }
+        Relationships: []
+      }
       ingredient_prices: {
         Row: {
           base_unit: string | null
@@ -303,6 +492,21 @@ export type Database = {
         }
         Relationships: []
       }
+      recipes_backup_meal: {
+        Row: {
+          id: string | null
+          meal_type: string | null
+        }
+        Insert: {
+          id?: string | null
+          meal_type?: string | null
+        }
+        Update: {
+          id?: string | null
+          meal_type?: string | null
+        }
+        Relationships: []
+      }
       shopping_list_checks: {
         Row: {
           checked: boolean
@@ -470,11 +674,33 @@ export type Database = {
         }
         Relationships: []
       }
+      user_suggestion_prefs: {
+        Row: {
+          prefs_text: string | null
+          updated_at: string
+          user_id: string
+        }
+        Insert: {
+          prefs_text?: string | null
+          updated_at?: string
+          user_id: string
+        }
+        Update: {
+          prefs_text?: string | null
+          updated_at?: string
+          user_id?: string
+        }
+        Relationships: []
+      }
     }
     Views: {
       [_ in never]: never
     }
     Functions: {
+      apply_ingredient_harmonization: {
+        Args: { p_confirmation: string; p_run_id: string }
+        Returns: Json
+      }
       has_list_access: {
         Args: { _list_id: string; _viewer: string }
         Returns: boolean
@@ -485,6 +711,12 @@ export type Database = {
           id: string
           name: string
         }[]
+      }
+      normalize_ingredient_alias: { Args: { p_text: string }; Returns: string }
+      normalize_nome: { Args: { t: string }; Returns: string }
+      preview_ingredient_harmonization: {
+        Args: { p_run_id: string }
+        Returns: Json
       }
     }
     Enums: {

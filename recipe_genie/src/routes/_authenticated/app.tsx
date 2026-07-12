@@ -18,8 +18,9 @@ import {
   Check,
   ArrowRightLeft,
   Printer,
+  RefreshCw,
 } from "lucide-react";
-import { suggestMeals } from "@/lib/suggest-meals.functions";
+import { suggestMeals, swapSuggestion } from "@/lib/suggest-meals.functions";
 import {
   addToShoppingList,
   listShoppingList,
@@ -121,6 +122,7 @@ function AppHome() {
   const [progress, setProgress] = useState("");
   const qc = useQueryClient();
   const suggest = useServerFn(suggestMeals);
+  const swapFn = useServerFn(swapSuggestion);
   const addToList = useServerFn(addToShoppingList);
 
   const mutation = useMutation({
@@ -264,10 +266,13 @@ function AppHome() {
 
   // Cópia local editável para permitir mover receitas entre dias.
   const [sections, setSections] = useState<Section[]>([]);
+  const [extraRecipes, setExtraRecipes] = useState<any[]>([]);
+  const [swappingId, setSwappingId] = useState<string | null>(null);
 
   useEffect(() => {
     if (mutation.data) {
       setSections(mutation.data.sections as Section[]);
+      setExtraRecipes([]);
     }
   }, [mutation.data]);
 
@@ -284,16 +289,13 @@ function AppHome() {
 
   const result = mutation.data;
 
-  const recipesById = useMemo(
-    () =>
-      new Map(
-        (result?.recipes ?? []).map((recipe) => [
-          recipe.id,
-          recipe,
-        ]),
-      ),
-    [result],
-  );
+  const recipesById = useMemo(() => {
+    const map = new Map(
+      (result?.recipes ?? []).map((recipe) => [recipe.id, recipe]),
+    );
+    for (const recipe of extraRecipes) map.set(recipe.id, recipe);
+    return map;
+  }, [result, extraRecipes]);
 
   const sectionNames = sections.map(
     (section) => section.section,
@@ -345,6 +347,70 @@ function AppHome() {
 
       return nextSections;
     });
+  }
+
+  async function swapPick(
+    sectionName: string,
+    recipeId: string,
+    mealType: string,
+  ) {
+    const promptUsed = (mutation.variables ?? "").toString().trim();
+    if (!promptUsed) return;
+
+    const visibleIds = sections.flatMap((section) =>
+      section.picks.map((pick) => pick.recipe_id),
+    );
+
+    setSwappingId(recipeId);
+    try {
+      const res = await swapFn({
+        data: {
+          prompt: promptUsed,
+          section: sectionName,
+          mealType: mealType as
+            | "entrada"
+            | "prato_principal"
+            | "sobremesa"
+            | "acompanhamento"
+            | "bebida",
+          excludeRecipeIds: [...new Set([...visibleIds, recipeId])],
+        },
+      });
+
+      if (!res.recipe) {
+        throw new Error("Sem alternativa disponível.");
+      }
+
+      const newRecipe = res.recipe;
+      const newPick = res.pick;
+
+      setExtraRecipes((previous) => [...previous, newRecipe]);
+      setSections((previousSections) =>
+        previousSections.map((section) =>
+          section.section !== sectionName
+            ? section
+            : {
+                ...section,
+                picks: section.picks.map((pick) =>
+                  pick.recipe_id === recipeId
+                    ? {
+                        recipe_id: newPick.recipe_id,
+                        reason: newPick.reason,
+                      }
+                    : pick,
+                ),
+              },
+        ),
+      );
+    } catch (error) {
+      toast.error(
+        error instanceof Error
+          ? error.message
+          : "Não foi possível trocar a sugestão.",
+      );
+    } finally {
+      setSwappingId(null);
+    }
   }
 
   return (
@@ -558,6 +624,24 @@ function AppHome() {
                           )}
 
                           <div className="mt-4 flex items-center gap-3 print:hidden">
+                            <button
+                              onClick={() =>
+                                swapPick(
+                                  section.section,
+                                  recipe.id,
+                                  recipe.meal_type,
+                                )
+                              }
+                              disabled={swappingId !== null}
+                              title="Trocar por outra sugestão"
+                              className="inline-flex items-center rounded-lg border border-border bg-card px-2.5 py-1.5 text-sm text-muted-foreground transition hover:bg-secondary hover:text-foreground disabled:opacity-50"
+                            >
+                              {swappingId === recipe.id ? (
+                                <Loader2 className="h-4 w-4 animate-spin" />
+                              ) : (
+                                <RefreshCw className="h-4 w-4" />
+                              )}
+                            </button>
                             {inListIds.has(recipe.id) ? (
                               <Link
                                 to="/shopping-list"
