@@ -4,6 +4,11 @@ import { generateText } from "ai";
 import { z } from "zod";
 import { createAiProvider } from "./ai-gateway.server";
 
+// Preferências de gosto por defeito, usadas quando o utilizador ainda não
+// definiu as suas. TEM de ficar igual à constante em user-prefs.functions.ts.
+const DEFAULT_USER_PREFS =
+  "Relaxa o orçamento até 30% acima do limite se valer a pena. Dá preferência às minhas receitas favoritas. Varia bastante as escolhas ao longo da semana.";
+
 type Suggestion = {
   interpretation: string;
   sections: Array<{
@@ -267,6 +272,16 @@ export const suggestMeals = createServerFn({ method: "POST" })
         .map((preference) => preference.recipe_id),
     );
 
+    // Preferências de gosto editáveis pelo utilizador. Sem linha => defaults.
+    const { data: prefsRow } = await context.supabase
+      .from("user_suggestion_prefs")
+      .select("prefs_text")
+      .eq("user_id", context.userId)
+      .maybeSingle();
+
+    const userPrefs =
+      (prefsRow?.prefs_text ?? "").trim() || DEFAULT_USER_PREFS;
+
     // 1) Pool leve sobre o catálogo INTEIRO classificado (id/título/tipo/tags).
     //    Nota: receitas sem meal_type canónico ficam fora do sorteio.
     const { data: poolRows, error: poolError } = await context.supabase
@@ -387,6 +402,9 @@ ${themeRule}`
 - Nunca repitas a mesma receita entre dias.
 - Garante variedade e equilíbrio ao longo da semana: alterna peixe, carne, opções vegetarianas e massa/arroz nos pratos principais.`;
 
+    const userPrefsBlock = `PREFERÊNCIAS DESTE UTILIZADOR (respeita-as dentro das regras obrigatórias acima; em caso de conflito, as regras técnicas ganham sempre):
+${userPrefs}`;
+
     const systemPrompt = `És um chef assistente. Sugeres refeições em português de Portugal a partir de um catálogo de receitas.
 
 Interpretas o pedido: número de pessoas, orçamento POR PESSOA, estilo, exclusões e tipos de prato pretendidos.
@@ -403,7 +421,9 @@ REGRAS OBRIGATÓRIAS:
 - Não devolvas uma secção vazia quando existirem receitas adequadas no catálogo.
 - Varia as escolhas: evita sugerir sempre os mesmos pratos óbvios quando houver alternativas adequadas.
 
-${planningRules}`;
+${planningRules}
+
+${userPrefsBlock}`;
 
     const expectedSection = data.targetSection ?? "entrada";
 
