@@ -15,6 +15,7 @@ import { Route as IndexRouteImport } from './routes/index'
 import { Route as AuthenticatedShoppingListRouteImport } from './routes/_authenticated/shopping-list'
 import { Route as AuthenticatedRecipesRouteImport } from './routes/_authenticated/recipes'
 import { Route as AuthenticatedPricesRouteImport } from './routes/_authenticated/prices'
+import { Route as AuthenticatedPreferencesRouteImport } from './routes/_authenticated/preferences'
 import { Route as AuthenticatedAppRouteImport } from './routes/_authenticated/app'
 import { Route as ApiPublicHooksWeeklyPricesRouteImport } from './routes/api/public/hooks/weekly-prices'
 import { Route as ApiPublicHooksImportTickRouteImport } from './routes/api/public/hooks/import-tick'
@@ -49,6 +50,12 @@ const AuthenticatedPricesRoute = AuthenticatedPricesRouteImport.update({
   path: '/prices',
   getParentRoute: () => AuthenticatedRouteRoute,
 } as any)
+const AuthenticatedPreferencesRoute =
+  AuthenticatedPreferencesRouteImport.update({
+    id: '/preferences',
+    path: '/preferences',
+    getParentRoute: () => AuthenticatedRouteRoute,
+  } as any)
 const AuthenticatedAppRoute = AuthenticatedAppRouteImport.update({
   id: '/app',
   path: '/app',
@@ -71,6 +78,7 @@ export interface FileRoutesByFullPath {
   '/': typeof IndexRoute
   '/auth': typeof AuthRoute
   '/app': typeof AuthenticatedAppRoute
+  '/preferences': typeof AuthenticatedPreferencesRoute
   '/prices': typeof AuthenticatedPricesRoute
   '/recipes': typeof AuthenticatedRecipesRoute
   '/shopping-list': typeof AuthenticatedShoppingListRoute
@@ -81,6 +89,7 @@ export interface FileRoutesByTo {
   '/': typeof IndexRoute
   '/auth': typeof AuthRoute
   '/app': typeof AuthenticatedAppRoute
+  '/preferences': typeof AuthenticatedPreferencesRoute
   '/prices': typeof AuthenticatedPricesRoute
   '/recipes': typeof AuthenticatedRecipesRoute
   '/shopping-list': typeof AuthenticatedShoppingListRoute
@@ -93,6 +102,7 @@ export interface FileRoutesById {
   '/_authenticated': typeof AuthenticatedRouteRouteWithChildren
   '/auth': typeof AuthRoute
   '/_authenticated/app': typeof AuthenticatedAppRoute
+  '/_authenticated/preferences': typeof AuthenticatedPreferencesRoute
   '/_authenticated/prices': typeof AuthenticatedPricesRoute
   '/_authenticated/recipes': typeof AuthenticatedRecipesRoute
   '/_authenticated/shopping-list': typeof AuthenticatedShoppingListRoute
@@ -105,6 +115,7 @@ export interface FileRouteTypes {
     | '/'
     | '/auth'
     | '/app'
+    | '/preferences'
     | '/prices'
     | '/recipes'
     | '/shopping-list'
@@ -115,6 +126,7 @@ export interface FileRouteTypes {
     | '/'
     | '/auth'
     | '/app'
+    | '/preferences'
     | '/prices'
     | '/recipes'
     | '/shopping-list'
@@ -126,6 +138,7 @@ export interface FileRouteTypes {
     | '/_authenticated'
     | '/auth'
     | '/_authenticated/app'
+    | '/_authenticated/preferences'
     | '/_authenticated/prices'
     | '/_authenticated/recipes'
     | '/_authenticated/shopping-list'
@@ -185,6 +198,13 @@ declare module '@tanstack/react-router' {
       preLoaderRoute: typeof AuthenticatedPricesRouteImport
       parentRoute: typeof AuthenticatedRouteRoute
     }
+    '/_authenticated/preferences': {
+      id: '/_authenticated/preferences'
+      path: '/preferences'
+      fullPath: '/preferences'
+      preLoaderRoute: typeof AuthenticatedPreferencesRouteImport
+      parentRoute: typeof AuthenticatedRouteRoute
+    }
     '/_authenticated/app': {
       id: '/_authenticated/app'
       path: '/app'
@@ -211,6 +231,7 @@ declare module '@tanstack/react-router' {
 
 interface AuthenticatedRouteRouteChildren {
   AuthenticatedAppRoute: typeof AuthenticatedAppRoute
+  AuthenticatedPreferencesRoute: typeof AuthenticatedPreferencesRoute
   AuthenticatedPricesRoute: typeof AuthenticatedPricesRoute
   AuthenticatedRecipesRoute: typeof AuthenticatedRecipesRoute
   AuthenticatedShoppingListRoute: typeof AuthenticatedShoppingListRoute
@@ -218,6 +239,7 @@ interface AuthenticatedRouteRouteChildren {
 
 const AuthenticatedRouteRouteChildren: AuthenticatedRouteRouteChildren = {
   AuthenticatedAppRoute: AuthenticatedAppRoute,
+  AuthenticatedPreferencesRoute: AuthenticatedPreferencesRoute,
   AuthenticatedPricesRoute: AuthenticatedPricesRoute,
   AuthenticatedRecipesRoute: AuthenticatedRecipesRoute,
   AuthenticatedShoppingListRoute: AuthenticatedShoppingListRoute,
