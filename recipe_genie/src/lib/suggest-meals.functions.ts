@@ -486,3 +486,187 @@ Responde EXCLUSIVAMENTE com um objeto JSON válido, sem markdown e sem blocos de
       recipes,
     };
   });
+
+// ---------------------------------------------------------------------------
+// Troca de uma única sugestão (botão "atualizar" num prato)
+// ---------------------------------------------------------------------------
+
+export const swapSuggestion = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) =>
+    z
+      .object({
+        prompt: z.string().min(3).max(1000),
+        section: z.string().min(2).max(50),
+        mealType: z.enum([
+          "entrada",
+          "prato_principal",
+          "sobremesa",
+          "acompanhamento",
+          "bebida",
+        ]),
+        excludeRecipeIds: z
+          .array(z.string().min(1).max(100))
+          .max(200)
+          .default([]),
+      })
+      .parse(input),
+  )
+  .handler(async ({ data, context }) => {
+    const { data: preferences } = await context.supabase
+      .from("recipe_preferences")
+      .select("recipe_id, status")
+      .eq("user_id", context.userId);
+
+    const excludedIds = new Set<string>([
+      ...(preferences ?? [])
+        .filter((preference) => preference.status === "excluded")
+        .map((preference) => preference.recipe_id),
+      ...data.excludeRecipeIds,
+    ]);
+
+    const favoriteIds = new Set(
+      (preferences ?? [])
+        .filter((preference) => preference.status === "favorite")
+        .map((preference) => preference.recipe_id),
+    );
+
+    const { data: prefsRow } = await context.supabase
+      .from("user_suggestion_prefs")
+      .select("prefs_text")
+      .eq("user_id", context.userId)
+      .maybeSingle();
+
+    const userPrefs =
+      (prefsRow?.prefs_text ?? "").trim() || DEFAULT_USER_PREFS;
+
+    // Pool só do tipo de prato a trocar, sem as receitas já visíveis.
+    const { data: poolRows, error: poolError } = await context.supabase
+      .from("recipes")
+      .select("id,title,meal_type,tags")
+      .eq("meal_type", data.mealType);
+
+    if (poolError) throw new Error(poolError.message);
+
+    let pool = ((poolRows ?? []) as PoolRecipe[]).filter(
+      (recipe) => !excludedIds.has(recipe.id),
+    );
+
+    if (pool.length === 0) {
+      throw new Error(
+        "Não há mais receitas deste tipo disponíveis para trocar.",
+      );
+    }
+
+    // Tema do dia, apenas para pratos principais em dias úteis.
+    const theme =
+      data.mealType === "prato_principal" ? themeForDay(data.section) : null;
+
+    if (theme) {
+      const themed = pool.filter((recipe) => matchesTheme(recipe, theme));
+      if (themed.length >= 5) pool = themed;
+    }
+
+    const candidates = sampleCandidates(pool, favoriteIds, 16);
+    const candidateIds = candidates.map((recipe) => recipe.id);
+
+    const { data: detailRows, error: detailError } = await context.supabase
+      .from("recipes")
+      .select(
+        "id,title,meal_type,cuisine_style,tags,estimated_cost_per_serving,calories_per_serving,source_url,image_url,author,source_site",
+      )
+      .in("id", candidateIds);
+
+    if (detailError) throw new Error(detailError.message);
+
+    const recipes = detailRows ?? [];
+
+    const apiKey = process.env.AI_API_KEY;
+    if (!apiKey) throw new Error("Missing AI_API_KEY");
+
+    const gateway = createAiProvider(apiKey);
+    const model = gateway(process.env.AI_MODEL || "gemini-3.1-flash-lite");
+
+    const catalog = recipes.map((recipe) => ({
+      id: recipe.id,
+      title: recipe.title,
+      meal_type: recipe.meal_type,
+      cuisine: recipe.cuisine_style,
+      tags: recipe.tags,
+      cost_per_serving: recipe.estimated_cost_per_serving,
+      calories: recipe.calories_per_serving,
+      author: recipe.author,
+      source_site: recipe.source_site,
+      favorite: favoriteIds.has(recipe.id),
+    }));
+
+    const systemPrompt = `És um chef assistente. Escolhes UMA receita alternativa em português de Portugal a partir de um catálogo.
+
+REGRAS OBRIGATÓRIAS:
+- Escolhe exatamente 1 receita do catálogo fornecido.
+- Copia o campo id exatamente como aparece no catálogo.
+- Dá preferência a favorite=true quando a receita cumprir o pedido.
+- Não inventes receitas nem IDs.
+${theme ? `- Tema do dia: ${THEME_LABELS[theme]}. Dá preferência a receitas alinhadas.` : ""}
+
+PREFERÊNCIAS DESTE UTILIZADOR (respeita-as dentro das regras obrigatórias acima; em caso de conflito, as regras técnicas ganham sempre):
+${userPrefs}`;
+
+    const userPrompt = `Pedido original do utilizador:
+"${data.prompt}"
+
+O utilizador rejeitou uma sugestão de tipo "${data.mealType}" no dia/secção "${data.section}" e quer uma alternativa diferente.
+
+Catálogo (${catalog.length} receitas, JSON):
+${JSON.stringify(catalog)}
+
+Responde EXCLUSIVAMENTE com um objeto JSON válido, sem markdown, neste formato:
+{"pick":{"recipe_id":"uuid","reason":"..."}}`;
+
+    let text: string;
+
+    try {
+      const generated = await generateText({
+        model,
+        system: systemPrompt,
+        prompt: userPrompt,
+        temperature: 0.6,
+        maxOutputTokens: 300,
+        maxRetries: 1,
+        timeout: 30_000,
+      });
+
+      text = generated.text;
+    } catch (error) {
+      throw friendlyAiError(error);
+    }
+
+    const cleaned = text.replace(/```json\s*/gi, "").replace(/```/g, "").trim();
+
+    let pick: { recipe_id: string; reason: string } | null = null;
+    try {
+      const parsed = JSON.parse(
+        cleaned.slice(cleaned.indexOf("{"), cleaned.lastIndexOf("}") + 1),
+      );
+      if (parsed?.pick && typeof parsed.pick.recipe_id === "string") {
+        pick = {
+          recipe_id: parsed.pick.recipe_id,
+          reason: String(parsed.pick.reason ?? ""),
+        };
+      }
+    } catch {
+      pick = null;
+    }
+
+    const validIds = new Set(recipes.map((recipe) => recipe.id));
+
+    // Fallback determinístico: se o modelo falhar, devolve a primeira candidata.
+    if (!pick || !validIds.has(pick.recipe_id)) {
+      const fallback = candidates[0];
+      pick = { recipe_id: fallback.id, reason: "Alternativa sorteada." };
+    }
+
+    const recipe = recipes.find((r) => r.id === pick!.recipe_id) ?? null;
+
+    return { pick, recipe };
+  });
