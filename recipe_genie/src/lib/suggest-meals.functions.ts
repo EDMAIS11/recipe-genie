@@ -354,7 +354,7 @@ export const suggestMeals = createServerFn({ method: "POST" })
     const { data: detailRows, error: detailError } = await context.supabase
       .from("recipes")
       .select(
-        "id,title,meal_type,cuisine_style,tags,estimated_cost_per_serving,calories_per_serving,source_url,image_url",
+        "id,title,meal_type,cuisine_style,tags,estimated_cost_per_serving,calories_per_serving,source_url,image_url,author,source_site",
       )
       .in("id", candidateIds);
 
@@ -378,6 +378,8 @@ export const suggestMeals = createServerFn({ method: "POST" })
       tags: recipe.tags,
       cost_per_serving: recipe.estimated_cost_per_serving,
       calories: recipe.calories_per_serving,
+      author: recipe.author,
+      source_site: recipe.source_site,
       favorite: favoriteIds.has(recipe.id),
     }));
 
