@@ -65,62 +65,149 @@ function parseSuggestion(text: string): Suggestion | null {
   };
 }
 
-function selectRecipesForAi<
-  T extends {
-    id: string;
-    title?: string | null;
-    meal_type?: string | null;
-  },
->(recipes: T[], favoriteIds: Set<string>): T[] {
-  const ordered = [...recipes].sort((left, right) => {
-    const favoriteDifference =
-      Number(favoriteIds.has(right.id)) -
-      Number(favoriteIds.has(left.id));
+// ---------------------------------------------------------------------------
+// Amostragem aleatória e temas semanais
+// ---------------------------------------------------------------------------
 
-    if (favoriteDifference !== 0) return favoriteDifference;
+type PoolRecipe = {
+  id: string;
+  title: string | null;
+  meal_type: string | null;
+  tags: string[] | null;
+};
 
-    return String(left.title ?? "").localeCompare(
-      String(right.title ?? ""),
-      "pt",
-    );
-  });
+function normalizeText(value: string): string {
+  return value
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
+}
 
-  const selected: T[] = [];
-  const selectedIds = new Set<string>();
-
-  const addRecipes = (candidates: T[], limit: number) => {
-    for (const recipe of candidates) {
-      if (selected.length >= 120 || limit <= 0) break;
-      if (selectedIds.has(recipe.id)) continue;
-
-      selected.push(recipe);
-      selectedIds.add(recipe.id);
-      limit -= 1;
-    }
-  };
-
-  // Mantém variedade suficiente para os três tipos usados no plano semanal.
-  for (const mealType of [
-    "entrada",
-    "prato_principal",
-    "sobremesa",
-  ]) {
-    addRecipes(
-      ordered.filter((recipe) => recipe.meal_type === mealType),
-      35,
-    );
+function shuffle<T>(items: T[]): T[] {
+  const result = [...items];
+  for (let i = result.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [result[i], result[j]] = [result[j], result[i]];
   }
+  return result;
+}
 
-  // Preenche os lugares restantes com bebidas, acompanhamentos, snacks
-  // ou mais receitas dos tipos principais.
-  addRecipes(ordered, 120 - selected.length);
+// Palavras-chave por tema (alinhadas com a árvore de categorias da app).
+const THEME_KEYWORDS: Record<string, string[]> = {
+  peixe: [
+    "peixe", "bacalhau", "salmao", "atum", "polvo", "choco", "lulas",
+    "camarao", "marisco", "sardinha", "dourada", "robalo", "pescada",
+    "mexilh", "ameijoa", "gambas", "lagosta", "truta", "tamboril",
+    "carapau", "anchova",
+  ],
+  carne: [
+    "carne", "frango", "galinha", "peru", "pato", "porco", "leitao",
+    "bacon", "chouric", "presunto", "entrecosto", "vaca", "vitela",
+    "bife", "novilho", "picanha", "borrego", "cabrito", "cordeiro",
+    "salsicha", "hambur", "almondeg", "costel", "figado",
+  ],
+  vegetariano: [
+    "vegetarian", "vegan", "legumes", "tofu", "grao-de-bico", "grao de bico",
+    "lentilha", "feijao", "cogumelo", "beringela", "curgete", "couve-flor",
+    "abobora", "espinafre",
+  ],
+  massa_arroz: [
+    "massa", "esparguete", "lasanha", "risotto", "risoto", "arroz",
+    "noodles", "spaghetti", "penne", "nhoque", "cuscuz",
+  ],
+};
 
-  return selected;
+const THEME_LABELS: Record<string, string> = {
+  peixe: "peixe ou marisco",
+  carne: "carne",
+  vegetariano: "vegetariano",
+  massa_arroz: "massa ou arroz",
+};
+
+function matchesTheme(recipe: PoolRecipe, theme: string): boolean {
+  const keywords = THEME_KEYWORDS[theme];
+  if (!keywords) return true;
+  const haystack = normalizeText(
+    [recipe.title ?? "", ...(recipe.tags ?? [])].join(" "),
+  );
+  return keywords.some((keyword) => haystack.includes(keyword));
+}
+
+const WEEKDAY_INDEX: Record<string, number> = {
+  "segunda-feira": 0,
+  "terca-feira": 1,
+  "quarta-feira": 2,
+  "quinta-feira": 3,
+  "sexta-feira": 4,
+  "sabado": 5,
+  "domingo": 6,
+};
+
+function isoWeekNumber(date: Date): number {
+  const d = new Date(Date.UTC(date.getFullYear(), date.getMonth(), date.getDate()));
+  const dayNum = d.getUTCDay() || 7;
+  d.setUTCDate(d.getUTCDate() + 4 - dayNum);
+  const yearStart = new Date(Date.UTC(d.getUTCFullYear(), 0, 1));
+  return Math.ceil(((d.getTime() - yearStart.getTime()) / 86400000 + 1) / 7);
+}
+
+// Rotação base com as garantias pedidas: pelo menos 1 dia de peixe,
+// pelo menos 1 vegetariano, sem repetir o mesmo tema em dias consecutivos
+// (a propriedade mantém-se em qualquer rotação, incluindo ciclicamente).
+const BASE_ROTATION = ["peixe", "carne", "vegetariano", "massa_arroz", "carne"];
+
+// Tema do dia, determinístico dentro da mesma semana (todas as chamadas dessa
+// semana veem a mesma rotação) mas diferente de semana para semana.
+function themeForDay(targetSection: string): string | null {
+  const dayIndex = WEEKDAY_INDEX[normalizeText(targetSection)];
+  if (dayIndex === undefined) return null; // não é um dia da semana
+  if (dayIndex >= 5) return null; // fim-de-semana: tema livre
+  const shift = isoWeekNumber(new Date()) % BASE_ROTATION.length;
+  return BASE_ROTATION[(dayIndex + shift) % BASE_ROTATION.length];
+}
+
+// Amostra aleatória com peso 2 para favoritas: cada favorita entra duas
+// vezes no sorteio, ou seja, tem o dobro da probabilidade de ser escolhida
+// (mas nunca é garantida).
+function sampleCandidates(
+  pool: PoolRecipe[],
+  favoriteIds: Set<string>,
+  count: number,
+): PoolRecipe[] {
+  const weighted: PoolRecipe[] = [];
+  for (const recipe of pool) {
+    weighted.push(recipe);
+    if (favoriteIds.has(recipe.id)) weighted.push(recipe);
+  }
+  const picked: PoolRecipe[] = [];
+  const pickedIds = new Set<string>();
+  for (const recipe of shuffle(weighted)) {
+    if (picked.length >= count) break;
+    if (pickedIds.has(recipe.id)) continue;
+    picked.push(recipe);
+    pickedIds.add(recipe.id);
+  }
+  return picked;
 }
 
 function friendlyAiError(error: unknown): Error {
   const rawMessage =
     error instanceof Error ? error.message : String(error ?? "");
+  const status =
+    (error as any)?.statusCode ?? (error as any)?.status ?? null;
+  const url = (error as any)?.url ?? null;
+  const responseBody =
+    typeof (error as any)?.responseBody === "string"
+      ? (error as any).responseBody.slice(0, 300)
+      : null;
+
+  // Contexto para os logs do Netlify: nunca mais um "Not Found" mudo.
+  console.error("AI request failed:", {
+    message: rawMessage,
+    status,
+    url,
+    responseBody,
+  });
 
   if (
     /timeout|timed out|deadline|aborted|504|gateway/i.test(rawMessage)
@@ -136,9 +223,15 @@ function friendlyAiError(error: unknown): Error {
     );
   }
 
-  return new Error(
+  const detail = [
     rawMessage || "Não foi possível obter sugestões da IA.",
-  );
+    status ? `(HTTP ${status})` : null,
+    responseBody ? `— ${responseBody}` : null,
+  ]
+    .filter(Boolean)
+    .join(" ");
+
+  return new Error(detail);
 }
 
 export const suggestMeals = createServerFn({ method: "POST" })
@@ -174,20 +267,26 @@ export const suggestMeals = createServerFn({ method: "POST" })
         .map((preference) => preference.recipe_id),
     );
 
-    const { data: allRecipes, error } = await context.supabase
+    // 1) Pool leve sobre o catálogo INTEIRO classificado (id/título/tipo/tags).
+    //    Nota: receitas sem meal_type canónico ficam fora do sorteio.
+    const { data: poolRows, error: poolError } = await context.supabase
       .from("recipes")
-      .select(
-        "id,title,meal_type,cuisine_style,tags,estimated_cost_per_serving,calories_per_serving,source_url,image_url",
-      )
-      .limit(300);
+      .select("id,title,meal_type,tags")
+      .in("meal_type", [
+        "entrada",
+        "prato_principal",
+        "sobremesa",
+        "acompanhamento",
+        "bebida",
+      ]);
 
-    if (error) throw new Error(error.message);
+    if (poolError) throw new Error(poolError.message);
 
-    const availableRecipes = (allRecipes ?? []).filter(
+    const pool = ((poolRows ?? []) as PoolRecipe[]).filter(
       (recipe) => !excludedIds.has(recipe.id),
     );
 
-    if (availableRecipes.length === 0) {
+    if (pool.length === 0) {
       return {
         interpretation:
           "Ainda não tens receitas disponíveis para este pedido.",
@@ -196,18 +295,64 @@ export const suggestMeals = createServerFn({ method: "POST" })
       };
     }
 
+    const byType = (mealType: string) =>
+      pool.filter((recipe) => recipe.meal_type === mealType);
+
+    // 2) Tema do dia (só nos dias úteis do plano semanal).
+    const theme = data.targetSection
+      ? themeForDay(data.targetSection)
+      : null;
+
+    // 3) Amostragem aleatória estratificada.
+    const candidates: PoolRecipe[] = [];
+
+    const mains = byType("prato_principal");
+    let themedMains = theme
+      ? mains.filter((recipe) => matchesTheme(recipe, theme))
+      : mains;
+    // Salvaguarda: se o tema apanhar poucas receitas, completa com pratos livres.
+    if (theme && themedMains.length < 10) {
+      themedMains = [
+        ...themedMains,
+        ...mains.filter((recipe) => !themedMains.includes(recipe)),
+      ];
+    }
+
+    candidates.push(
+      ...sampleCandidates(byType("entrada"), favoriteIds, 16),
+      ...sampleCandidates(themedMains, favoriteIds, 20),
+      ...sampleCandidates(byType("sobremesa"), favoriteIds, 16),
+    );
+
+    // Nos pedidos livres (não semanais) junta acompanhamentos e bebidas,
+    // porque o pedido pode mencioná-los.
+    if (!data.targetSection) {
+      candidates.push(
+        ...sampleCandidates(byType("acompanhamento"), favoriteIds, 6),
+        ...sampleCandidates(byType("bebida"), favoriteIds, 6),
+      );
+    }
+
+    // 4) Detalhes completos apenas das candidatas sorteadas.
+    const candidateIds = [...new Set(candidates.map((r) => r.id))];
+
+    const { data: detailRows, error: detailError } = await context.supabase
+      .from("recipes")
+      .select(
+        "id,title,meal_type,cuisine_style,tags,estimated_cost_per_serving,calories_per_serving,source_url,image_url",
+      )
+      .in("id", candidateIds);
+
+    if (detailError) throw new Error(detailError.message);
+
+    const recipes = detailRows ?? [];
+
     const apiKey = process.env.AI_API_KEY;
     if (!apiKey) throw new Error("Missing AI_API_KEY");
 
     const gateway = createAiProvider(apiKey);
     const model = gateway(
-      process.env.AI_MODEL || "gemini-2.5-flash",
-    );
-
-    // A IA recebe no máximo 120 receitas, em vez das 300 completas.
-    const recipes = selectRecipesForAi(
-      availableRecipes,
-      favoriteIds,
+      process.env.AI_MODEL || "gemini-3.1-flash-lite",
     );
 
     const catalog = recipes.map((recipe) => ({
@@ -221,6 +366,10 @@ export const suggestMeals = createServerFn({ method: "POST" })
       favorite: favoriteIds.has(recipe.id),
     }));
 
+    const themeRule = theme
+      ? `- Tema do dia para os PRATOS PRINCIPAIS: ${THEME_LABELS[theme]}. Escolhe pratos principais alinhados com este tema (o catálogo já vem maioritariamente filtrado). Entradas e sobremesas são livres.`
+      : "";
+
     const planningRules = data.targetSection
       ? `MODO DE GERAÇÃO PARCIAL:
 - Gera APENAS o dia/secção "${data.targetSection}".
@@ -228,13 +377,15 @@ export const suggestMeals = createServerFn({ method: "POST" })
 - Não devolvas os restantes dias da semana.
 - Por defeito, nesse dia devolve 2 entradas + 2 pratos principais + 2 sobremesas.
 - Se o pedido original limitar explicitamente os tipos de prato, respeita essa limitação.
-- As receitas usadas em dias anteriores já foram removidas do catálogo; não inventes IDs.`
+- As receitas usadas em dias anteriores já foram removidas do catálogo; não inventes IDs.
+${themeRule}`
       : `PLANEAMENTO SEMANAL:
 - Se o pedido falar em organizar/planear refeições da semana (por exemplo "semana", "semanal", "segunda a sexta", "dias úteis" ou "meal prep"), devolve EXATAMENTE 5 secções: "Segunda-feira", "Terça-feira", "Quarta-feira", "Quinta-feira" e "Sexta-feira", nesta ordem.
 - Se o pedido disser explicitamente "toda a semana", "7 dias", "sete dias" ou "segunda a domingo", inclui também "Sábado" e "Domingo".
 - Em cada dia devolve, por defeito, 2 entradas + 2 pratos principais + 2 sobremesas.
 - Se o pedido só mencionar um tipo, como "prato principal" ou "almoço rápido", devolve apenas 2 pratos principais.
-- Nunca repitas a mesma receita entre dias.`;
+- Nunca repitas a mesma receita entre dias.
+- Garante variedade e equilíbrio ao longo da semana: alterna peixe, carne, opções vegetarianas e massa/arroz nos pratos principais.`;
 
     const systemPrompt = `És um chef assistente. Sugeres refeições em português de Portugal a partir de um catálogo de receitas.
 
@@ -250,6 +401,7 @@ REGRAS OBRIGATÓRIAS:
 - cost_per_serving é sempre o custo POR PESSOA.
 - Não inventes receitas, preços, calorias nem IDs.
 - Não devolvas uma secção vazia quando existirem receitas adequadas no catálogo.
+- Varia as escolhas: evita sugerir sempre os mesmos pratos óbvios quando houver alternativas adequadas.
 
 ${planningRules}`;
 
@@ -273,7 +425,7 @@ Responde EXCLUSIVAMENTE com um objeto JSON válido, sem markdown e sem blocos de
         model,
         system: systemPrompt,
         prompt: userPrompt,
-        temperature: 0.25,
+        temperature: 0.45,
         maxOutputTokens: data.targetSection ? 1200 : 1800,
         maxRetries: 1,
         timeout: 45_000,
