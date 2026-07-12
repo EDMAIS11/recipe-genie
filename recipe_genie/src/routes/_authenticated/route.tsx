@@ -1,5 +1,5 @@
 import { createFileRoute, Outlet, redirect, Link, useNavigate } from "@tanstack/react-router";
-import { ChefHat, BookOpen, Sparkles, LogOut, Wallet, ShoppingCart } from "lucide-react";
+import { ChefHat, BookOpen, Sparkles, LogOut, Wallet, ShoppingCart, SlidersHorizontal } from "lucide-react";
 import { supabase } from "@/integrations/supabase/client";
 import { useQueryClient } from "@tanstack/react-query";
 
@@ -43,6 +43,7 @@ function AuthedLayout() {
             <NavLink to="/recipes" icon={<BookOpen className="h-4 w-4" />} label="Receitas" />
             <NavLink to="/prices" icon={<Wallet className="h-4 w-4" />} label="Preços" />
             <NavLink to="/shopping-list" icon={<ShoppingCart className="h-4 w-4" />} label="Compras" />
+            <NavLink to="/preferences" icon={<SlidersHorizontal className="h-4 w-4" />} label="Preferências" />
             <button
               onClick={signOut}
               className="ml-1 flex shrink-0 items-center gap-1.5 rounded-lg px-2 py-1.5 text-sm text-muted-foreground transition hover:bg-secondary hover:text-foreground sm:ml-2 sm:px-3"
