@@ -112,6 +112,7 @@ function computeRecipePaths(r: any): Set<string> {
   const meal = r.meal_type ?? null;
   const paths = new Set<string>();
   const walk = (node: CatNode, prefix: string): boolean => {
+    if (node.mealType && meal && meal !== node.mealType) return false;
     const p = prefix ? `${prefix}/${node.id}` : node.id;
     const selfMatch =
       (node.mealType && meal === node.mealType) ||
